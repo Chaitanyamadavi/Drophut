@@ -129,3 +129,9 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
   .terms-body { padding: 17px 19px; font-size: 13px; }
   .terms-actions { padding: 14px 19px 18px; }
 }
+
+.download-toast { position: fixed; right: max(20px, env(safe-area-inset-right)); bottom: max(20px, env(safe-area-inset-bottom)); z-index: 20; display: flex; align-items: center; gap: 18px; width: min(440px, calc(100vw - 32px)); padding: 14px 16px; border: 1px solid #111111; border-radius: 12px; background: #111111; color: #FFFFFF; box-shadow: 0 12px 36px rgb(17 17 17 / 20%); font-size: 13px; line-height: 1.45; }
+.download-toast span { flex: 1; }
+.download-toast button { flex: none; padding: 7px 12px; border: 0; border-radius: 7px; background: #B7FF3C; color: #111111; font-weight: 700; }
+.download-toast button:hover { background: #9FE62E; }
+.signaling-note { margin: 12px 0; color: #666666; font-size: 12px; text-align: center; }

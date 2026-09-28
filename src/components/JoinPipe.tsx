@@ -23,11 +23,9 @@ type PipeMessage = {
 };
 
 type JoinStatus = "idle" | "joining" | "connecting" | "connected";
-type WritableFile = { write(data: ArrayBuffer): Promise<void>; close(): Promise<void>; abort?: () => Promise<void> };
-type SaveFileHandle = { createWritable(): Promise<WritableFile> };
-type PickerWindow = Window & { showSaveFilePicker?: (options: { suggestedName: string }) => Promise<SaveFileHandle> };
-type IncomingTransfer = { transferId: string; name: string; mimeType: string; size: number; totalChunks: number; chunkSize: number; chunks: ArrayBuffer[]; receivedBytes: number; writer: WritableFile | null; accepted: boolean };
-type ReceivedFile = { name: string; mimeType: string; size: number; url?: string; savedToDisk: boolean };
+type IncomingTransfer = { transferId: string; name: string; mimeType: string; size: number; totalChunks: number; chunkSize: number; chunks: ArrayBuffer[]; receivedBytes: number };
+type ReceivedFile = { name: string; mimeType: string; size: number; url: string };
+type DownloadNotice = { name: string; url: string; openBlocked: boolean };
 const CHUNK_SIZE = 16 * 1024;
 const ACK_BATCH_SIZE = 32;
 
@@ -54,9 +52,11 @@ function JoinPipe({ onHome }: JoinPipeProps) {
   const [error, setError] = useState("");
   const [receivedFile, setReceivedFile] = useState<ReceivedFile | null>(null);
   const [incomingOffer, setIncomingOffer] = useState<{ name: string; mimeType: string; size: number } | null>(null);
-  const [receiveStatus, setReceiveStatus] = useState<"waiting" | "offered" | "receiving" | "received" | "error">("waiting");
+  const [receiveStatus, setReceiveStatus] = useState<"waiting" | "receiving" | "received" | "error">("waiting");
   const [receivedBytes, setReceivedBytes] = useState(0);
   const [receiveWarning, setReceiveWarning] = useState("");
+  const [downloadNotice, setDownloadNotice] = useState<DownloadNotice | null>(null);
+  const [signalingStatus, setSignalingStatus] = useState<"connected" | "reconnecting">("connected");
   const socketRef = useRef<WebSocket | null>(null);
   const mountedRef = useRef(false);
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
@@ -70,6 +70,11 @@ function JoinPipe({ onHome }: JoinPipeProps) {
   const responseTimeoutRef = useRef<number | null>(null);
   const connectionTimeoutRef = useRef<number | null>(null);
   const statusRef = useRef<JoinStatus>("idle");
+  const sessionCodeRef = useRef<string | null>(null);
+  const reconnectTimerRef = useRef<number | null>(null);
+  const reconnectAttemptsRef = useRef(0);
+  const pendingSignalsRef = useRef<SignalPayload[]>([]);
+  const localAnswerRef = useRef<RTCSessionDescriptionInit | null>(null);
 
   function clearTimers() {
     if (responseTimeoutRef.current !== null) {
@@ -97,7 +102,12 @@ function JoinPipe({ onHome }: JoinPipeProps) {
     if (transfer) retireTransferId(transfer.transferId);
     if (!transfer) return Promise.resolve();
     transfer.chunks.length = 0;
-    return transfer.writer?.abort ? transfer.writer.abort().catch(() => undefined) : Promise.resolve();
+    return Promise.resolve();
+  }
+
+  function sendTransferControl(type: string, transferId: string, extra: Record<string, unknown> = {}) {
+    const channel = dataChannelRef.current;
+    if (channel?.readyState === "open") channel.send(JSON.stringify({ type, transferId, ...extra }));
   }
 
   function armIncomingTimeout(channel: RTCDataChannel, transferId: string) {
@@ -109,7 +119,7 @@ function JoinPipe({ onHome }: JoinPipeProps) {
       transfer.chunks.length = 0;
       incomingFileRef.current = null;
       incomingTimeoutRef.current = null;
-      if (transfer.writer?.abort) void transfer.writer.abort().catch(() => undefined);
+
       setIncomingOffer(null);
       const message = "The file transfer timed out before it completed.";
       setReceiveStatus("error");
@@ -147,6 +157,10 @@ function JoinPipe({ onHome }: JoinPipeProps) {
   }
 
   function fail(message: string) {
+    sessionCodeRef.current = null;
+    pendingSignalsRef.current = [];
+    if (reconnectTimerRef.current !== null) window.clearTimeout(reconnectTimerRef.current);
+    reconnectTimerRef.current = null;
     clearTimers();
     closePeerConnection();
     const socket = socketRef.current;
@@ -162,17 +176,46 @@ function JoinPipe({ onHome }: JoinPipeProps) {
     setError(message);
     setStatus("idle");
     statusRef.current = "idle";
+    setSignalingStatus("connected");
   }
 
   function sendSignal(payload: SignalPayload) {
     const socket = socketRef.current;
-    if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      pendingSignalsRef.current.push(payload);
+      if (pendingSignalsRef.current.length > 256) pendingSignalsRef.current.shift();
+      if (sessionCodeRef.current) scheduleSignalingReconnect(sessionCodeRef.current);
+      return true;
+    }
     try {
       socket.send(JSON.stringify(payload));
       return true;
     } catch {
-      return false;
+      pendingSignalsRef.current.push(payload);
+      if (pendingSignalsRef.current.length > 256) pendingSignalsRef.current.shift();
+      if (sessionCodeRef.current) scheduleSignalingReconnect(sessionCodeRef.current);
+      return true;
     }
+  }
+
+  function flushPendingSignals() {
+    const queued = pendingSignalsRef.current.splice(0);
+    for (const payload of queued) {
+      if (payload.type === "webrtc-offer" || payload.type === "webrtc-answer") continue;
+      if (!sendSignal(payload)) pendingSignalsRef.current.push(payload);
+    }
+  }
+
+  function scheduleSignalingReconnect(pipeCode: string) {
+    if (!mountedRef.current || sessionCodeRef.current !== pipeCode || reconnectTimerRef.current !== null) return;
+    setSignalingStatus("reconnecting");
+    const attempt = reconnectAttemptsRef.current++;
+    const delay = Math.min(1000 * 2 ** Math.min(attempt, 4), 15000);
+    console.warn("[DropHut receiver] Signaling unavailable; retrying", { pipeCode, attempt: attempt + 1, delay });
+    reconnectTimerRef.current = window.setTimeout(() => {
+      reconnectTimerRef.current = null;
+      if (!socketRef.current || socketRef.current.readyState === WebSocket.CLOSED) openSignalingSocket(pipeCode);
+    }, delay);
   }
 
   function startConnectionTimeout() {
@@ -192,45 +235,24 @@ function JoinPipe({ onHome }: JoinPipeProps) {
     statusRef.current = "connected";
   }
 
-  function supportsIncrementalSave() {
-    return typeof (window as PickerWindow).showSaveFilePicker === "function";
-  }
-
-  function sendTransferControl(type: string, transferId: string, extra: Record<string, unknown> = {}) {
-    const channel = dataChannelRef.current;
-    if (channel?.readyState === "open") channel.send(JSON.stringify({ type, transferId, ...extra }));
-  }
-
-  async function chooseSaveDestination() {
-    const transfer = incomingFileRef.current;
-    const channel = dataChannelRef.current;
-    const picker = (window as PickerWindow).showSaveFilePicker;
-    if (!transfer || !channel || !picker || transfer.accepted) return;
+  function openDownloadedFile() {
+    if (!downloadNotice) return;
     try {
-      const handle = await picker.call(window, { suggestedName: transfer.name });
-      const writer = await handle.createWritable();
-      if (incomingFileRef.current !== transfer || channel.readyState !== "open") {
-        if (writer.abort) await writer.abort();
-        return;
+      const openedWindow = window.open(downloadNotice.url, "_blank");
+      if (openedWindow) {
+        openedWindow.opener = null;
+        setDownloadNotice({ ...downloadNotice, openBlocked: false });
+      } else {
+        setDownloadNotice({ ...downloadNotice, openBlocked: true });
       }
-      transfer.writer = writer;
-      transfer.accepted = true;
-      console.info("[DropHut receiver] Destination ready", { transferId: transfer.transferId, name: transfer.name });
-      setReceivedBytes(0);
-      setReceiveStatus("receiving");
-      setError("");
-      armIncomingTimeout(channel, transfer.transferId);
-      sendTransferControl("receiver-ready", transfer.transferId);
-    } catch (reason) {
-      if (reason instanceof DOMException && reason.name === "AbortError") return;
-      const message = reason instanceof Error ? reason.message : "Could not open the destination file.";
-      setError(message);
-      setReceiveStatus("offered");
+    } catch {
+      setDownloadNotice({ ...downloadNotice, openBlocked: true });
     }
   }
 
   function receiveAnotherFile() {
     if (receivedFileUrlRef.current) { URL.revokeObjectURL(receivedFileUrlRef.current); receivedFileUrlRef.current = null; }
+    setDownloadNotice(null);
     setReceivedFile(null);
     setReceivedBytes(0);
     setReceiveStatus("waiting");
@@ -296,21 +318,17 @@ function JoinPipe({ onHome }: JoinPipeProps) {
         }
         if (receivedFileUrlRef.current) { URL.revokeObjectURL(receivedFileUrlRef.current); receivedFileUrlRef.current = null; }
         setReceivedFile(null);
-        const incremental = supportsIncrementalSave();
-        console.info("[DropHut receiver] Transfer started", { transferId: message.transferId, name: message.name, size: message.size, totalChunks: message.totalChunks, incrementalSave: incremental });
+        console.info("[DropHut receiver] Transfer started", { transferId: message.transferId, name: message.name, size: message.size, totalChunks: message.totalChunks });
         setIncomingOffer({ name: message.name, mimeType: message.mimeType, size: message.size as number });
-        incomingFileRef.current = { transferId: message.transferId, name: message.name, mimeType: message.mimeType, size: message.size as number, totalChunks: message.totalChunks as number, chunkSize: CHUNK_SIZE, chunks: [], receivedBytes: 0, writer: null, accepted: !incremental };
+        incomingFileRef.current = { transferId: message.transferId, name: message.name, mimeType: message.mimeType, size: message.size as number, totalChunks: message.totalChunks as number, chunkSize: CHUNK_SIZE, chunks: [], receivedBytes: 0 };
         setReceivedBytes(0);
-        setReceiveWarning(incremental ? "" : "This browser cannot save incrementally. The complete file will be held in memory; large transfers may exceed available memory.");
+        setReceiveWarning("The completed file is assembled in browser memory before download. Very large files may exceed available memory.");
+        setDownloadNotice(null);
         setError("");
-        if (incremental) {
-          setReceiveStatus("offered");
-        } else {
-          setReceiveStatus("receiving");
-          armIncomingTimeout(channel, message.transferId as string);
-          console.info("[DropHut receiver] Receiver ready (memory fallback)", { transferId: message.transferId });
+        setReceiveStatus("receiving");
+        armIncomingTimeout(channel, message.transferId as string);
+        console.info("[DropHut receiver] Receiver ready for browser download", { transferId: message.transferId });
         sendTransferControl("receiver-ready", message.transferId);
-        }
         return;
       }
       if (message.type === "file-end") {
@@ -319,32 +337,34 @@ function JoinPipe({ onHome }: JoinPipeProps) {
           console.debug("[DropHut receiver] Ignored stale file-end", { transferId: message.transferId, activeTransferId: transfer?.transferId });
           return;
         }
-        if (!transfer.accepted || message.totalChunks !== transfer.totalChunks || message.size !== transfer.size || transfer.chunks.length !== (transfer.writer ? 0 : transfer.totalChunks) || transfer.receivedBytes !== transfer.size) {
+        if (message.totalChunks !== transfer.totalChunks || message.size !== transfer.size || transfer.chunks.length !== transfer.totalChunks || transfer.receivedBytes !== transfer.size) {
           rejectTransfer("The received file was incomplete or did not match its metadata.", message.transferId); return;
         }
         try {
-          let url: string | undefined;
-          if (transfer.writer) {
-            await transfer.writer.close();
-            if (incomingFileRef.current !== transfer) return;
-          } else {
-            const blob = new Blob(transfer.chunks, { type: transfer.mimeType });
-            url = URL.createObjectURL(blob);
-          }
+          const blob = new Blob(transfer.chunks, { type: transfer.mimeType });
+          const url = URL.createObjectURL(blob);
           const { name, mimeType, size, transferId } = transfer;
           transfer.chunks.length = 0;
           if (incomingTimeoutRef.current !== null) { window.clearTimeout(incomingTimeoutRef.current); incomingTimeoutRef.current = null; }
           incomingFileRef.current = null;
-          receivedFileUrlRef.current = url ?? null;
+          receivedFileUrlRef.current = url;
           retireTransferId(transferId);
-          setReceivedFile({ name, mimeType, size, url, savedToDisk: !url });
+          const downloadLink = document.createElement("a");
+          downloadLink.href = url;
+          downloadLink.download = name;
+          downloadLink.style.display = "none";
+          document.body.appendChild(downloadLink);
+          downloadLink.click();
+          downloadLink.remove();
+          setReceivedFile({ name, mimeType, size, url });
+          setDownloadNotice({ name, url, openBlocked: false });
           setIncomingOffer(null);
           setReceiveStatus("received");
           setError("");
           sendTransferControl("file-received", transferId, { size });
-          console.info("[DropHut receiver] File transfer complete", { transferId, name, size, savedToDisk: !url });
+          console.info("[DropHut receiver] File transfer complete and browser download triggered", { transferId, name, size });
         } catch (reason) {
-          rejectTransfer(reason instanceof Error ? reason.message : "Could not finish writing the destination file.", transfer.transferId);
+          rejectTransfer(reason instanceof Error ? reason.message : "Could not prepare the completed file for download.", transfer.transferId);
         }
         return;
       }
@@ -354,14 +374,13 @@ function JoinPipe({ onHome }: JoinPipeProps) {
 
     if (!(data instanceof ArrayBuffer)) { rejectTransfer("Received an unsupported file chunk."); return; }
     const transfer = incomingFileRef.current;
-    if (!transfer || !transfer.accepted) { rejectTransfer("Received file data before the receiver was ready."); return; }
+    if (!transfer) { rejectTransfer("Received file data before the receiver was ready."); return; }
     if (transfer.chunks.length >= transfer.totalChunks) { rejectTransfer("Received more chunks than expected.", transfer.transferId); return; }
-    const chunkIndex = transfer.writer ? transfer.receivedBytes / transfer.chunkSize : transfer.chunks.length;
+    const chunkIndex = transfer.chunks.length;
     const expectedBytes = chunkIndex === transfer.totalChunks - 1 ? transfer.size - chunkIndex * transfer.chunkSize : transfer.chunkSize;
     if (!Number.isInteger(chunkIndex) || data.byteLength !== expectedBytes) { rejectTransfer("A received file chunk had an invalid size or order.", transfer.transferId); return; }
     try {
-      if (transfer.writer) await transfer.writer.write(data);
-      else transfer.chunks.push(data);
+      transfer.chunks.push(data);
       if (incomingFileRef.current !== transfer) return;
       transfer.receivedBytes += data.byteLength;
       armIncomingTimeout(channel, transfer.transferId);
@@ -488,6 +507,7 @@ function JoinPipe({ onHome }: JoinPipeProps) {
       await peer.setLocalDescription(answer);
       const local = peer.localDescription;
       console.debug("[DropHut receiver] Local description set", local);
+      localAnswerRef.current = local ? { type: local.type, sdp: local.sdp } : null;
       if (!local || !sendSignal({ type: "webrtc-answer", code: pipeCode, answer: { type: local.type, sdp: local.sdp } })) {
         throw new Error("Could not send the WebRTC answer.");
       }
@@ -501,6 +521,9 @@ function JoinPipe({ onHome }: JoinPipeProps) {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+      sessionCodeRef.current = null;
+      if (reconnectTimerRef.current !== null) window.clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
       clearTimers();
       closePeerConnection();
       if (receivedFileUrlRef.current) { URL.revokeObjectURL(receivedFileUrlRef.current); receivedFileUrlRef.current = null; }
@@ -523,29 +546,25 @@ function JoinPipe({ onHome }: JoinPipeProps) {
     setError("");
   }
 
-  function joinPipe() {
-    if (!/^\d{6}$/.test(code) || status === "joining" || socketRef.current) return;
-    setError("");
-    setStatus("joining");
-    statusRef.current = "joining";
-
+  function openSignalingSocket(pipeCode: string) {
+    if (socketRef.current && socketRef.current.readyState !== WebSocket.CLOSED) return;
     let socket: WebSocket;
     try {
       socket = new WebSocket(getSignalingUrl());
     } catch {
-      setError("Could not connect to the signaling server. Please try again.");
-      setStatus("idle");
-      statusRef.current = "idle";
+      scheduleSignalingReconnect(pipeCode);
       return;
     }
     socketRef.current = socket;
-    responseTimeoutRef.current = window.setTimeout(() => fail("The signaling server did not respond. Please try again."), 5000);
-
     socket.onopen = () => {
+      if (responseTimeoutRef.current !== null) window.clearTimeout(responseTimeoutRef.current);
+      responseTimeoutRef.current = window.setTimeout(() => {
+        if (socketRef.current === socket && socket.readyState === WebSocket.OPEN) socket.close();
+      }, 12000);
       try {
-        socket.send(JSON.stringify({ type: "join-pipe", code }));
+        socket.send(JSON.stringify({ type: "join-pipe", code: pipeCode }));
       } catch {
-        fail("Could not send the join request. Please try again.");
+        socket.close();
       }
     };
 
@@ -565,17 +584,33 @@ function JoinPipe({ onHome }: JoinPipeProps) {
         fail("Received an invalid response from the server.");
         return;
       }
-      if (message.code !== undefined && message.code !== code) return;
+      if (message.code !== undefined && message.code !== pipeCode) return;
 
       if (message.type === "error") {
-        fail(message.message || "The signaling server reported an error.");
+        const retryable = message.message === "The other peer disconnected" ||
+          (reconnectAttemptsRef.current > 0 && message.message === "Pipe not found");
+        if (retryable) {
+          console.warn("[DropHut receiver] Signaling session needs recovery", message.message);
+          socket.close();
+        } else {
+          fail(message.message || "The signaling server reported an error.");
+        }
       } else if (message.type === "peer-joined") {
-        if (statusRef.current !== "joining") return;
-        setStatus("connecting");
-        statusRef.current = "connecting";
-        startConnectionTimeout();
+        reconnectAttemptsRef.current = 0;
+        setSignalingStatus("connected");
+        if (statusRef.current === "joining") {
+          setStatus("connecting");
+          statusRef.current = "connecting";
+          startConnectionTimeout();
+        } else {
+          const peer = peerConnectionRef.current;
+          if (peer?.signalingState === "stable" && localAnswerRef.current && dataChannelRef.current?.readyState !== "open") {
+            sendSignal({ type: "webrtc-answer", code: pipeCode, answer: localAnswerRef.current });
+          }
+          flushPendingSignals();
+        }
       } else if (message.type === "webrtc-offer" && message.offer) {
-        void handleOffer(code, message.offer).catch((reason: unknown) => {
+        void handleOffer(pipeCode, message.offer).catch((reason: unknown) => {
           fail(reason instanceof Error ? reason.message : "Could not handle the WebRTC offer.");
         });
       } else if (message.type === "webrtc-ice" && message.candidate) {
@@ -588,12 +623,30 @@ function JoinPipe({ onHome }: JoinPipeProps) {
       }
     };
 
-    socket.onerror = () => fail("Could not connect to the signaling server. Please try again.");
-    socket.onclose = () => {
-      if (socketRef.current === socket && statusRef.current !== "idle") {
-        fail("The signaling connection closed.");
-      }
+    socket.onerror = (event) => {
+      console.warn("[DropHut receiver] WebSocket error; preserving peer connection and retrying", event);
     };
+    socket.onclose = () => {
+      if (socketRef.current !== socket) return;
+      socketRef.current = null;
+      if (responseTimeoutRef.current !== null) {
+        window.clearTimeout(responseTimeoutRef.current);
+        responseTimeoutRef.current = null;
+      }
+      if (sessionCodeRef.current === pipeCode) scheduleSignalingReconnect(pipeCode);
+    };
+  }
+
+  function joinPipe() {
+    if (!/^\d{6}$/.test(code) || status === "joining" || socketRef.current) return;
+    setError("");
+    setStatus("joining");
+    statusRef.current = "joining";
+
+    sessionCodeRef.current = code;
+    reconnectAttemptsRef.current = 0;
+    localAnswerRef.current = null;
+    openSignalingSocket(code);
   }
 
   return (
@@ -609,19 +662,18 @@ function JoinPipe({ onHome }: JoinPipeProps) {
             <div className="connected-label"><span className="status-dot" />File received ✓</div>
             <h1 id="join-title">{receivedFile.name}</h1>
             <p className="pipe-hint">{formatFileSize(receivedFile.size)} · {receivedFile.mimeType}</p>
-            {receivedFile.savedToDisk ? <p>Saved to the selected location.</p> : receivedFile.url && <a className="button button-primary button-full" href={receivedFile.url} download={receivedFile.name}>Download</a>}
+            <p>Your browser started the download.</p>
             <button className="button button-secondary button-full" onClick={receiveAnotherFile}>Receive another file</button>
           </div>
         ) : status === "connected" ? (
           <div className="pipe-card receiver-card">
             <div className="connected-label"><span className="status-dot" />Connected ✓</div>
-            <h1 id="join-title">{receiveStatus === "offered" ? "File ready to receive" : "Connected to pipe"}</h1>
-            {incomingOffer && receiveStatus === "offered" ? <p className="pipe-hint">{incomingOffer.name} · {formatFileSize(incomingOffer.size)}</p> : null}
-            <p className="pipe-hint">{receiveStatus === "receiving" ? "Receiving file…" : receiveStatus === "error" ? "Could not receive the file." : receiveStatus === "offered" ? "Choose where to save this file." : "Waiting for the sender to send a file."}</p>
+            <h1 id="join-title">"Connected to pipe"</h1>
+            {incomingOffer ? <p className="pipe-hint">{incomingOffer.name} · {formatFileSize(incomingOffer.size)}</p> : null}
+            <p className="pipe-hint">{receiveStatus === "receiving" ? "Receiving file…" : receiveStatus === "error" ? "Could not receive the file." : "Waiting for the sender to send a file."}</p>
             {receiveStatus === "receiving" && incomingOffer && <p>{formatFileSize(receivedBytes)} / {formatFileSize(incomingOffer.size)} · {incomingOffer.size ? Math.floor(receivedBytes / incomingOffer.size * 100) : 0}%</p>}
             {receiveWarning && <p className="transfer-note">{receiveWarning}</p>}
-            {receiveStatus === "offered" && <button className="button button-primary button-full" onClick={() => { void chooseSaveDestination(); }}>Choose destination</button>}
-            {(receiveStatus === "offered" || receiveStatus === "receiving") && <button className="button button-secondary button-full" onClick={() => { void cancelReceive(); }}>Cancel transfer</button>}
+            {receiveStatus === "receiving" && <button className="button button-secondary button-full" onClick={() => { void cancelReceive(); }}>Cancel transfer</button>}
             {error && <p className="error-message" role="alert">{error}</p>}
           </div>
         ) : status === "connecting" ? (
@@ -655,7 +707,18 @@ function JoinPipe({ onHome }: JoinPipeProps) {
             {error && <p className="error-message" role="alert">{error}</p>}
           </>
         )}
+      {signalingStatus === "reconnecting" && (
+        <p className="signaling-note" role="status">
+          {status === "connected" ? "Signaling reconnecting; the direct connection is still active." : "Signaling reconnecting; keeping this pipe session available."}
+        </p>
+      )}
       </section>
+      {downloadNotice && (
+        <aside className="download-toast" role="status" aria-live="polite">
+          <span>{downloadNotice.openBlocked ? "Download started. Your browser blocked opening the file." : `${downloadNotice.name} downloaded`}</span>
+          <button type="button" onClick={openDownloadedFile}>Open</button>
+        </aside>
+      )}
     </main>
   );
 }

@@ -56,6 +56,7 @@ function CreatePipe({ onHome }: CreatePipeProps) {
   const [copied, setCopied] = useState(false);
   const [transferStatus, setTransferStatus] = useState<TransferStatus>("idle");
   const [transferredBytes, setTransferredBytes] = useState(0);
+  const [signalingStatus, setSignalingStatus] = useState<"connected" | "reconnecting">("connected");
   const socketRef = useRef<WebSocket | null>(null);
   const mountedRef = useRef(false);
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
@@ -73,6 +74,10 @@ function CreatePipe({ onHome }: CreatePipeProps) {
   const responseTimeoutRef = useRef<number | null>(null);
   const connectionTimeoutRef = useRef<number | null>(null);
   const statusRef = useRef<SendStatus>("selecting");
+  const sessionCodeRef = useRef<string | null>(null);
+  const reconnectTimerRef = useRef<number | null>(null);
+  const reconnectAttemptsRef = useRef(0);
+  const pendingSignalsRef = useRef<SignalPayload[]>([]);
 
   function clearTimers() {
     if (responseTimeoutRef.current !== null) {
@@ -121,6 +126,10 @@ function CreatePipe({ onHome }: CreatePipeProps) {
     cancelWaitRef.current?.();
     pendingControlRef.current?.reject(new Error(message));
     pendingControlRef.current = null;
+    sessionCodeRef.current = null;
+    if (reconnectTimerRef.current !== null) window.clearTimeout(reconnectTimerRef.current);
+    reconnectTimerRef.current = null;
+    pendingSignalsRef.current = [];
     clearTimers();
     closePeerConnection();
     const socket = socketRef.current;
@@ -137,17 +146,46 @@ function CreatePipe({ onHome }: CreatePipeProps) {
     setCode("");
     setStatus("selecting");
     statusRef.current = "selecting";
+    setSignalingStatus("connected");
   }
 
   function sendSignal(payload: SignalPayload) {
     const socket = socketRef.current;
-    if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
+      pendingSignalsRef.current.push(payload);
+      if (pendingSignalsRef.current.length > 256) pendingSignalsRef.current.shift();
+      if (sessionCodeRef.current) scheduleSignalingReconnect(sessionCodeRef.current);
+      return true;
+    }
     try {
       socket.send(JSON.stringify(payload));
       return true;
     } catch {
-      return false;
+      pendingSignalsRef.current.push(payload);
+      if (pendingSignalsRef.current.length > 256) pendingSignalsRef.current.shift();
+      if (sessionCodeRef.current) scheduleSignalingReconnect(sessionCodeRef.current);
+      return true;
     }
+  }
+
+  function flushPendingSignals() {
+    const queued = pendingSignalsRef.current.splice(0);
+    for (const payload of queued) {
+      if (payload.type === "webrtc-offer" || payload.type === "webrtc-answer") continue;
+      if (!sendSignal(payload)) pendingSignalsRef.current.push(payload);
+    }
+  }
+
+  function scheduleSignalingReconnect(pipeCode: string) {
+    if (!mountedRef.current || sessionCodeRef.current !== pipeCode || reconnectTimerRef.current !== null) return;
+    setSignalingStatus("reconnecting");
+    const attempt = reconnectAttemptsRef.current++;
+    const delay = Math.min(1000 * 2 ** Math.min(attempt, 4), 15000);
+    console.warn("[DropHut sender] Signaling unavailable; retrying", { pipeCode, attempt: attempt + 1, delay });
+    reconnectTimerRef.current = window.setTimeout(() => {
+      reconnectTimerRef.current = null;
+      if (!socketRef.current || socketRef.current.readyState === WebSocket.CLOSED) openSignalingSocket(pipeCode);
+    }, delay);
   }
 
   function startConnectionTimeout() {
@@ -312,6 +350,9 @@ function CreatePipe({ onHome }: CreatePipeProps) {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+      sessionCodeRef.current = null;
+      if (reconnectTimerRef.current !== null) window.clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
       transferCancelledRef.current = true;
       cancelWaitRef.current?.();
       pendingControlRef.current?.reject(new Error("Component unmounted."));
@@ -348,38 +389,25 @@ function CreatePipe({ onHome }: CreatePipeProps) {
     selectFiles(event.dataTransfer.files);
   }
 
-  function createPipe() {
-    if (!files.length || socketRef.current || status === "creating") return;
-
-    const random = new Uint32Array(1);
-    crypto.getRandomValues(random);
-    const newCode = String(100000 + (random[0] % 900000));
-    transferStatusRef.current = "idle";
-    transferCancelledRef.current = false;
-    setTransferredBytes(0);
-    setTransferStatus("idle");
-    setCode("");
-    setError("");
-    setStatus("creating");
-    statusRef.current = "creating";
-
+  function openSignalingSocket(pipeCode: string) {
+    if (socketRef.current && socketRef.current.readyState !== WebSocket.CLOSED) return;
     let socket: WebSocket;
     try {
       socket = new WebSocket(getSignalingUrl());
     } catch {
-      setError("Could not connect to the signaling server. Please try again.");
-      setStatus("selecting");
-      statusRef.current = "selecting";
+      scheduleSignalingReconnect(pipeCode);
       return;
     }
     socketRef.current = socket;
-    responseTimeoutRef.current = window.setTimeout(() => fail("The signaling server did not respond. Please try again."), 5000);
-
     socket.onopen = () => {
+      if (responseTimeoutRef.current !== null) window.clearTimeout(responseTimeoutRef.current);
+      responseTimeoutRef.current = window.setTimeout(() => {
+        if (socketRef.current === socket && socket.readyState === WebSocket.OPEN) socket.close();
+      }, 12000);
       try {
-        socket.send(JSON.stringify({ type: "create-pipe", code: newCode }));
+        socket.send(JSON.stringify({ type: "create-pipe", code: pipeCode }));
       } catch {
-        fail("Could not send the create request. Please try again.");
+        socket.close();
       }
     };
 
@@ -388,7 +416,6 @@ function CreatePipe({ onHome }: CreatePipeProps) {
         window.clearTimeout(responseTimeoutRef.current);
         responseTimeoutRef.current = null;
       }
-
       let message: PipeMessage;
       try {
         message = JSON.parse(event.data);
@@ -400,25 +427,45 @@ function CreatePipe({ onHome }: CreatePipeProps) {
         fail("Received an invalid response from the server.");
         return;
       }
-      if (message.code !== undefined && message.code !== newCode) return;
+      if (message.code !== undefined && message.code !== pipeCode) return;
 
       if (message.type === "error") {
-        fail(message.message || "The signaling server reported an error.");
-      } else if (message.type === "pipe-created" && message.code === newCode) {
-        setCode(newCode);
-        setStatus("waiting");
-        statusRef.current = "waiting";
-      } else if (message.type === "peer-joined" && message.code === newCode) {
-        if (statusRef.current !== "waiting") return;
-        setStatus("connecting");
-        statusRef.current = "connecting";
-        startConnectionTimeout();
-        void startOffer(newCode).catch((reason: unknown) => {
-          fail(reason instanceof Error ? reason.message : "Could not start the WebRTC offer.");
-        });
+        const retryable = message.message === "The other peer disconnected" ||
+          (reconnectAttemptsRef.current > 0 && message.message === "This pipe code is already in use");
+        if (retryable) {
+          console.warn("[DropHut sender] Signaling session needs recovery", message.message);
+          socket.close();
+        } else {
+          fail(message.message || "The signaling server reported an error.");
+        }
+      } else if (message.type === "pipe-created" && message.code === pipeCode) {
+        reconnectAttemptsRef.current = 0;
+        setSignalingStatus("connected");
+        if (statusRef.current === "creating") {
+          setCode(pipeCode);
+          setStatus("waiting");
+          statusRef.current = "waiting";
+        }
+      } else if (message.type === "peer-joined" && message.code === pipeCode) {
+        setSignalingStatus("connected");
+        reconnectAttemptsRef.current = 0;
+        if (statusRef.current === "waiting") {
+          setStatus("connecting");
+          statusRef.current = "connecting";
+          startConnectionTimeout();
+          void startOffer(pipeCode).catch((reason: unknown) => {
+            fail(reason instanceof Error ? reason.message : "Could not start the WebRTC offer.");
+          });
+        } else {
+          const peer = peerConnectionRef.current;
+          if (peer?.signalingState === "have-local-offer" && peer.localDescription && dataChannelRef.current?.readyState !== "open") {
+            sendSignal({ type: "webrtc-offer", code: pipeCode, offer: { type: peer.localDescription.type, sdp: peer.localDescription.sdp } });
+          }
+          flushPendingSignals();
+        }
       } else if (message.type === "webrtc-answer" && message.answer) {
         const peer = peerConnectionRef.current;
-        if (!peer) return;
+        if (!peer || peer.remoteDescription) return;
         console.debug("[DropHut sender] Received SDP answer", message.answer);
         void peer.setRemoteDescription(message.answer).then(() => {
           console.debug("[DropHut sender] Remote description set", peer.remoteDescription);
@@ -436,12 +483,38 @@ function CreatePipe({ onHome }: CreatePipeProps) {
       }
     };
 
-    socket.onerror = () => fail("Could not connect to the signaling server. Please try again.");
-    socket.onclose = () => {
-      if (socketRef.current === socket && statusRef.current !== "selecting") {
-        fail("The signaling connection closed.");
-      }
+    socket.onerror = (event) => {
+      console.warn("[DropHut sender] WebSocket error; preserving peer connection and retrying", event);
     };
+    socket.onclose = () => {
+      if (socketRef.current !== socket) return;
+      socketRef.current = null;
+      if (responseTimeoutRef.current !== null) {
+        window.clearTimeout(responseTimeoutRef.current);
+        responseTimeoutRef.current = null;
+      }
+      if (sessionCodeRef.current === pipeCode) scheduleSignalingReconnect(pipeCode);
+    };
+  }
+
+  function createPipe() {
+    if (!files.length || socketRef.current || status === "creating") return;
+
+    const random = new Uint32Array(1);
+    crypto.getRandomValues(random);
+    const newCode = String(100000 + (random[0] % 900000));
+    transferStatusRef.current = "idle";
+    transferCancelledRef.current = false;
+    setTransferredBytes(0);
+    setTransferStatus("idle");
+    setCode("");
+    setError("");
+    setStatus("creating");
+    statusRef.current = "creating";
+
+    sessionCodeRef.current = newCode;
+    reconnectAttemptsRef.current = 0;
+    openSignalingSocket(newCode);
   }
 
   async function copyCode() {
@@ -657,7 +730,7 @@ function CreatePipe({ onHome }: CreatePipeProps) {
             <h2>{transferStatus === "sending" ? "Sending file…" : transferStatus === "sent" ? "File sent ✓" : transferStatus === "error" ? "Send failed" : "Ready to send"}</h2>
             <p>{files[0]?.name} · {formatFileSize(files[0]?.size ?? 0)}</p>
             {(transferStatus === "preparing" || transferStatus === "sending") && <p>{formatFileSize(transferredBytes)} / {formatFileSize(files[0]?.size ?? 0)} · {files[0]?.size ? Math.floor(transferredBytes / files[0].size * 100) : 0}%</p>}
-            {transferStatus === "preparing" && <p>Waiting for receiver to choose a save location…</p>}
+            {transferStatus === "preparing" && <p>Waiting for receiver to get ready…</p>}
             {(transferStatus === "preparing" || transferStatus === "sending") && <button className="button button-secondary button-full" onClick={cancelTransfer}>Cancel transfer</button>}
             {transferStatus === "idle" && <button className="button button-primary button-full" onClick={sendFile}>Send file</button>}
             {transferStatus === "sent" && <><p>The receiver confirmed the file.</p><button className="button button-primary button-full" onClick={prepareAnotherTransfer}>Send another</button><label className="button button-secondary button-full" htmlFor="next-file-picker">Choose another file</label><input id="next-file-picker" className="visually-hidden" type="file" onChange={handleNextFileChange} /></>}
@@ -666,6 +739,11 @@ function CreatePipe({ onHome }: CreatePipeProps) {
         )}
 
         {error && <p className="error-message" role="alert">{error}</p>}
+        {signalingStatus === "reconnecting" && (
+          <p className="signaling-note" role="status">
+            {status === "connected" || status === "transfer" ? "Signaling reconnecting; the direct connection is still active." : "Signaling reconnecting; keeping this pipe session available."}
+          </p>
+        )}
       </section>
       <p className="privacy-note">Files are sent directly to the receiver. One file is sent in 16 KB chunks.</p>
     </main>
