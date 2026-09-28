@@ -36,8 +36,8 @@ const ICE_CONFIGURATION: RTCConfiguration = {
 };
 
 function getSignalingUrl() {
-  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  return `${protocol}//${window.location.hostname}:8080`;
+  return import.meta.env.VITE_SIGNALING_URL ||
+    (import.meta.env.DEV ? "ws://localhost:8080" : "wss://drophut.onrender.com");
 }
 
 type SignalPayload = {
