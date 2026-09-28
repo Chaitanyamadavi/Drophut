@@ -23,7 +23,7 @@ type PipeMessage = {
 };
 
 type JoinStatus = "idle" | "joining" | "connecting" | "connected";
-type IncomingTransfer = { transferId: string; name: string; mimeType: string; size: number; totalChunks: number; chunkSize: number; chunks: ArrayBuffer[]; receivedBytes: number };
+type IncomingTransfer = { transferId: string; name: string; mimeType: string; size: number; totalChunks: number; chunkSize: number; chunks: ArrayBuffer[]; receivedBytes: number; startedAt: number };
 type ReceivedFile = { name: string; mimeType: string; size: number; url: string };
 type DownloadNotice = { name: string; url: string; openBlocked: boolean };
 const CHUNK_SIZE = 16 * 1024;
@@ -65,7 +65,7 @@ function JoinPipe({ onHome }: JoinPipeProps) {
   const receivedFileUrlRef = useRef<string | null>(null);
   const retiredTransferIdsRef = useRef(new Set<string>());
   const incomingTimeoutRef = useRef<number | null>(null);
-  const messageQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const lastProgressUpdateRef = useRef(0);
   const pendingIceRef = useRef<RTCIceCandidateInit[]>([]);
   const responseTimeoutRef = useRef<number | null>(null);
   const connectionTimeoutRef = useRef<number | null>(null);
@@ -95,14 +95,14 @@ function JoinPipe({ onHome }: JoinPipeProps) {
     }
   }
 
-  function clearIncomingTransfer(): Promise<void> {
+  function clearIncomingTransfer() {
     if (incomingTimeoutRef.current !== null) { window.clearTimeout(incomingTimeoutRef.current); incomingTimeoutRef.current = null; }
     const transfer = incomingFileRef.current;
     incomingFileRef.current = null;
-    if (transfer) retireTransferId(transfer.transferId);
-    if (!transfer) return Promise.resolve();
-    transfer.chunks.length = 0;
-    return Promise.resolve();
+    if (transfer) {
+      retireTransferId(transfer.transferId);
+      transfer.chunks.length = 0;
+    }
   }
 
   function sendTransferControl(type: string, transferId: string, extra: Record<string, unknown> = {}) {
@@ -263,10 +263,10 @@ function JoinPipe({ onHome }: JoinPipeProps) {
   async function cancelReceive() {
     const transfer = incomingFileRef.current;
     if (transfer) {
-      await clearIncomingTransfer();
+      clearIncomingTransfer();
       sendTransferControl("file-cancelled", transfer.transferId);
     } else {
-      await clearIncomingTransfer();
+      clearIncomingTransfer();
     }
     setReceivedBytes(0);
     setIncomingOffer(null);
@@ -275,7 +275,7 @@ function JoinPipe({ onHome }: JoinPipeProps) {
     setReceiveWarning("");
   }
 
-  async function handleDataMessage(channel: RTCDataChannel, data: unknown) {
+  function handleDataMessage(channel: RTCDataChannel, data: unknown) {
     if (dataChannelRef.current !== channel) return;
     const rejectTransfer = (message: string, transferId?: string) => {
       console.error("[DropHut receiver] Transfer failed", { transferId, message });
@@ -291,7 +291,7 @@ function JoinPipe({ onHome }: JoinPipeProps) {
       if (message.type === "file-cancel") {
         if (incomingFileRef.current?.transferId === message.transferId) {
           console.info("[DropHut receiver] Sender cancelled transfer", { transferId: message.transferId });
-          await clearIncomingTransfer();
+          clearIncomingTransfer();
           setReceivedBytes(0);
           setIncomingOffer(null);
           setReceiveStatus("waiting");
@@ -318,10 +318,11 @@ function JoinPipe({ onHome }: JoinPipeProps) {
         }
         if (receivedFileUrlRef.current) { URL.revokeObjectURL(receivedFileUrlRef.current); receivedFileUrlRef.current = null; }
         setReceivedFile(null);
-        console.info("[DropHut receiver] Transfer started", { transferId: message.transferId, name: message.name, size: message.size, totalChunks: message.totalChunks });
+        console.info("[DropHut receiver] Transfer started", { transferId: message.transferId, name: message.name, mimeType: message.mimeType, expectedSize: message.size, totalChunks: message.totalChunks, chunkSize: message.chunkSize });
         setIncomingOffer({ name: message.name, mimeType: message.mimeType, size: message.size as number });
-        incomingFileRef.current = { transferId: message.transferId, name: message.name, mimeType: message.mimeType, size: message.size as number, totalChunks: message.totalChunks as number, chunkSize: CHUNK_SIZE, chunks: [], receivedBytes: 0 };
+        incomingFileRef.current = { transferId: message.transferId, name: message.name, mimeType: message.mimeType, size: message.size as number, totalChunks: message.totalChunks as number, chunkSize: CHUNK_SIZE, chunks: [], receivedBytes: 0, startedAt: performance.now() };
         setReceivedBytes(0);
+        lastProgressUpdateRef.current = 0;
         setReceiveWarning("The completed file is assembled in browser memory before download. Very large files may exceed available memory.");
         setDownloadNotice(null);
         setError("");
@@ -342,8 +343,11 @@ function JoinPipe({ onHome }: JoinPipeProps) {
         }
         try {
           const blob = new Blob(transfer.chunks, { type: transfer.mimeType });
-          const url = URL.createObjectURL(blob);
           const { name, mimeType, size, transferId } = transfer;
+          if (blob.size !== size) throw new Error(`Reconstructed file size ${blob.size} did not match expected size ${size}.`);
+          const url = URL.createObjectURL(blob);
+          const durationMs = performance.now() - transfer.startedAt;
+          const mibPerSecond = durationMs > 0 ? size / (1024 * 1024) / (durationMs / 1000) : 0;
           transfer.chunks.length = 0;
           if (incomingTimeoutRef.current !== null) { window.clearTimeout(incomingTimeoutRef.current); incomingTimeoutRef.current = null; }
           incomingFileRef.current = null;
@@ -362,7 +366,7 @@ function JoinPipe({ onHome }: JoinPipeProps) {
           setReceiveStatus("received");
           setError("");
           sendTransferControl("file-received", transferId, { size });
-          console.info("[DropHut receiver] File transfer complete and browser download triggered", { transferId, name, size });
+          console.info("[DropHut receiver] File transfer complete and browser download triggered", { transferId, name, mimeType: blob.type, expectedSize: size, reconstructedSize: blob.size, totalChunks: transfer.totalChunks, durationMs: Math.round(durationMs), mibPerSecond: Number(mibPerSecond.toFixed(2)), channelBufferedAmount: dataChannelRef.current?.bufferedAmount ?? 0 });
         } catch (reason) {
           rejectTransfer(reason instanceof Error ? reason.message : "Could not prepare the completed file for download.", transfer.transferId);
         }
@@ -386,8 +390,11 @@ function JoinPipe({ onHome }: JoinPipeProps) {
       armIncomingTimeout(channel, transfer.transferId);
       const nextChunk = chunkIndex + 1;
       if (nextChunk % ACK_BATCH_SIZE === 0 || nextChunk === transfer.totalChunks) {
-        setReceivedBytes(transfer.receivedBytes);
-        console.info("[DropHut receiver] Chunk batch written and acknowledged", { transferId: transfer.transferId, nextChunk, totalChunks: transfer.totalChunks, receivedBytes: transfer.receivedBytes });
+        const now = performance.now();
+        if (nextChunk === transfer.totalChunks || now - lastProgressUpdateRef.current >= 250) {
+          setReceivedBytes(transfer.receivedBytes);
+          lastProgressUpdateRef.current = now;
+        }
         sendTransferControl("chunk-ack", transfer.transferId, { nextChunk });
       }
     } catch (reason) {
@@ -404,12 +411,14 @@ function JoinPipe({ onHome }: JoinPipeProps) {
     };
     channel.binaryType = "arraybuffer";
     channel.onmessage = (event) => {
-      messageQueueRef.current = messageQueueRef.current.then(() => handleDataMessage(channel, event.data)).catch((reason: unknown) => {
+      try {
+        handleDataMessage(channel, event.data);
+      } catch (reason) {
         const message = reason instanceof Error ? reason.message : "Could not process the file transfer.";
         setError(message);
         setReceiveStatus("error");
         clearIncomingTransfer();
-      });
+      }
     };
     channel.onclose = () => {
       console.info("[DropHut receiver] DataChannel state: closed");
