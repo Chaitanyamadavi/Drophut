@@ -768,11 +768,24 @@ function CreatePipe({ onHome }: CreatePipeProps) {
         <h1 id="send-title">{status === "selecting" || status === "creating" ? "Choose files to send" : status === "waiting" ? "Your Pipe" : status === "connected" ? "Ready to send" : status === "transfer" ? "Transfer" : "Connecting to receiver"}</h1>
 
         {(status === "selecting" || status === "creating") && (
-          <>
-            <div className="drop-zone" onDragOver={(event) => event.preventDefault()} onDrop={handleDrop}>
-              <div className="upload-icon" aria-hidden="true">↑</div>
-              <strong>Drop files here</strong>
-              <span>or <label htmlFor="file-picker" className="browse-link">browse</label></span>
+          <div className="send-file-selection">
+            <div className="upload-card" onDragOver={(event) => event.preventDefault()} onDrop={handleDrop}>
+              <div className="upload-card-icon" aria-hidden="true">
+                <svg className="folder-art" viewBox="0 0 72 64" fill="none">
+                  <path d="M7 17.5A5.5 5.5 0 0 1 12.5 12h15l6 7H59a5 5 0 0 1 5 5v25a5 5 0 0 1-5 5H13a6 6 0 0 1-6-6V17.5Z" fill="currentColor" fill-opacity=".12" stroke="currentColor" stroke-width="2.5" stroke-linejoin="round"/>
+                  <path d="M8 27h55" stroke="currentColor" stroke-opacity=".55" stroke-width="2"/>
+                </svg>
+                <span className="upload-arrow-badge"><svg viewBox="0 0 20 20" fill="none"><path d="M10 14V4m0 0L6 8m4-4 4 4M4 15v1.5A1.5 1.5 0 0 0 5.5 18h9a1.5 1.5 0 0 0 1.5-1.5V15" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+              </div>
+              <div className="upload-card-copy">
+                <span className="upload-eyebrow">SEND FILES</span>
+                <strong>Drop your files here</strong>
+                <span className="upload-support">or choose a file from your device</span>
+              </div>
+              <div className="upload-card-action">
+                <label htmlFor="file-picker" className="upload-browse-button">Browse files <span aria-hidden="true">↗</span></label>
+                <span className="upload-limit-note">Any file type <i aria-hidden="true">·</i> One file at a time</span>
+              </div>
               <input id="file-picker" className="visually-hidden" type="file" onChange={handleFileChange} />
             </div>
             {files.length > 0 && (
@@ -792,7 +805,7 @@ function CreatePipe({ onHome }: CreatePipeProps) {
                 </button>
               </div>
             )}
-          </>
+          </div>
         )}
 
         {(status === "waiting" || status === "connecting") && (

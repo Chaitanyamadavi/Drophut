@@ -135,3 +135,45 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .download-toast button { flex: none; padding: 7px 12px; border: 0; border-radius: 7px; background: #B7FF3C; color: #111111; font-weight: 700; }
 .download-toast button:hover { background: #9FE62E; }
 .signaling-note { margin: 12px 0; color: #666666; font-size: 12px; text-align: center; }
+
+/* CreatePipe file-selection card */
+.send-file-selection { width: 100%; display: grid; gap: 14px; }
+.upload-card { position: relative; display: grid; grid-template-columns: 76px minmax(0, 1fr) auto; align-items: center; gap: 20px; min-height: 164px; padding: 22px 24px; overflow: hidden; border: 1px solid rgb(255 255 255 / 13%); border-radius: 13px; background: #171A16; box-shadow: 0 0 32px rgb(183 255 60 / 6%), 0 16px 38px rgb(0 0 0 / 10%); color: #F5F6F2; }
+.upload-card::after { position: absolute; right: 24%; bottom: -55px; width: 180px; height: 100px; border-radius: 50%; background: rgb(183 255 60 / 5%); filter: blur(38px); content: ""; pointer-events: none; }
+.upload-card-icon { position: relative; display: grid; place-items: center; width: 76px; height: 68px; color: #B7FF3C; }
+.folder-art { width: 70px; height: 62px; overflow: visible; }
+.upload-arrow-badge { position: absolute; right: -1px; bottom: -1px; display: grid; width: 29px; height: 29px; place-items: center; border: 3px solid #171A16; border-radius: 50%; background: #B7FF3C; color: #111; }
+.upload-arrow-badge svg { width: 17px; height: 17px; }
+.upload-card-copy { display: flex; min-width: 0; flex-direction: column; align-items: flex-start; gap: 6px; }
+.upload-eyebrow { color: #B7FF3C; font-size: 10px; font-weight: 750; letter-spacing: .16em; line-height: 1.2; }
+.upload-card-copy strong { color: #F7F8F5; font-size: clamp(17px, 2.2vw, 21px); font-weight: 650; letter-spacing: -.025em; line-height: 1.2; }
+.upload-support { color: #B7BBB4; font-size: 13px; line-height: 1.4; }
+.upload-card-action { position: relative; z-index: 1; display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }
+.upload-browse-button { display: inline-flex; min-width: 146px; min-height: 46px; align-items: center; justify-content: center; gap: 12px; padding: 0 17px; border: 1px solid #B7FF3C; border-radius: 8px; background: #B7FF3C; color: #111; cursor: pointer; font-size: 14px; font-weight: 720; transition: background-color .16s ease, border-color .16s ease, transform .16s ease; }
+.upload-browse-button:hover { transform: translateY(-1px); border-color: #9FE62E; background: #9FE62E; }
+.upload-browse-button:focus-visible { outline: 3px solid rgb(183 255 60 / 45%); outline-offset: 3px; }
+.upload-browse-button span { font-size: 17px; line-height: 1; }
+.upload-limit-note { color: #92978F; font-size: 10px; letter-spacing: .015em; white-space: nowrap; }
+.upload-limit-note i { padding: 0 3px; color: #B7FF3C; font-style: normal; }
+.send-file-selection .file-panel { border-color: #30352D; background: #171A16; color: #F5F6F2; }
+.send-file-selection .section-heading h2 { color: #F5F6F2; }
+.send-file-selection .section-heading > span { color: #A8ADA5; }
+.send-file-selection .file-row { border-color: #30352D; }
+.send-file-selection .file-icon { background: rgb(183 255 60 / 12%); color: #B7FF3C; }
+.send-file-selection .file-name { color: #F5F6F2; }
+.send-file-selection .file-size { color: #A8ADA5; }
+.send-file-selection .button-primary { background: #B7FF3C; color: #111; }
+.send-file-selection .button-primary:hover:not(:disabled) { background: #9FE62E; }
+@media (max-width: 620px) {
+  .upload-card { grid-template-columns: 58px minmax(0, 1fr); gap: 15px; min-height: 0; padding: 19px; }
+  .upload-card-icon { width: 58px; height: 56px; }
+  .folder-art { width: 58px; height: 52px; }
+  .upload-arrow-badge { right: -2px; bottom: -3px; width: 25px; height: 25px; border-width: 2px; }
+  .upload-card-action { grid-column: 2; align-items: flex-start; gap: 7px; }
+}
+@media (max-width: 390px) {
+  .upload-card { grid-template-columns: 1fr; gap: 12px; padding: 18px; }
+  .upload-card-icon { width: 58px; height: 52px; }
+  .upload-card-action { grid-column: 1; width: 100%; }
+  .upload-browse-button { width: 100%; }
+}
