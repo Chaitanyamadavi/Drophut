@@ -25,6 +25,7 @@ type PipeMessage = {
 type JoinStatus = "idle" | "joining" | "connecting" | "connected";
 type IncomingTransfer = { transferId: string; name: string; mimeType: string; size: number; totalChunks: number; chunkSize: number; chunks: ArrayBuffer[]; receivedBytes: number; startedAt: number };
 type ReceivedFile = { name: string; mimeType: string; size: number; url: string };
+type ReceivedTextMessage = { id: string; text: string };
 type DownloadNotice = { name: string; url: string; openBlocked: boolean };
 const CHUNK_SIZE = 16 * 1024;
 const ACK_BATCH_SIZE = 32;
@@ -56,6 +57,7 @@ function JoinPipe({ onHome }: JoinPipeProps) {
   const [receivedBytes, setReceivedBytes] = useState(0);
   const [receiveWarning, setReceiveWarning] = useState("");
   const [downloadNotice, setDownloadNotice] = useState<DownloadNotice | null>(null);
+  const [receivedTexts, setReceivedTexts] = useState<ReceivedTextMessage[]>([]);
   const [signalingStatus, setSignalingStatus] = useState<"connected" | "reconnecting">("connected");
   const socketRef = useRef<WebSocket | null>(null);
   const mountedRef = useRef(false);
@@ -63,6 +65,7 @@ function JoinPipe({ onHome }: JoinPipeProps) {
   const dataChannelRef = useRef<RTCDataChannel | null>(null);
   const incomingFileRef = useRef<IncomingTransfer | null>(null);
   const receivedFileUrlRef = useRef<string | null>(null);
+  const downloadUrlTimersRef = useRef(new Map<string, number>());
   const retiredTransferIdsRef = useRef(new Set<string>());
   const incomingTimeoutRef = useRef<number | null>(null);
   const lastProgressUpdateRef = useRef(0);
@@ -250,8 +253,28 @@ function JoinPipe({ onHome }: JoinPipeProps) {
     }
   }
 
+  function clearDownloadedUrls() {
+    for (const [url, timer] of downloadUrlTimersRef.current) {
+      window.clearTimeout(timer);
+      URL.revokeObjectURL(url);
+    }
+    downloadUrlTimersRef.current.clear();
+    receivedFileUrlRef.current = null;
+  }
+
+  function retainDownloadedUrl(url: string) {
+    receivedFileUrlRef.current = url;
+    const timer = window.setTimeout(() => {
+      URL.revokeObjectURL(url);
+      downloadUrlTimersRef.current.delete(url);
+      if (receivedFileUrlRef.current === url) receivedFileUrlRef.current = null;
+      setDownloadNotice((current) => current?.url === url ? null : current);
+    }, 60_000);
+    downloadUrlTimersRef.current.set(url, timer);
+  }
+
   function receiveAnotherFile() {
-    if (receivedFileUrlRef.current) { URL.revokeObjectURL(receivedFileUrlRef.current); receivedFileUrlRef.current = null; }
+    clearDownloadedUrls();
     setDownloadNotice(null);
     setReceivedFile(null);
     setReceivedBytes(0);
@@ -286,8 +309,17 @@ function JoinPipe({ onHome }: JoinPipeProps) {
     };
 
     if (typeof data === "string") {
-      let message: { type?: string; transferId?: string; name?: string; mimeType?: string; size?: number; totalChunks?: number; chunkSize?: number };
+      let message: { type?: string; transferId?: string; name?: string; mimeType?: string; size?: number; totalChunks?: number; chunkSize?: number; id?: string; text?: string };
       try { message = JSON.parse(data); } catch { rejectTransfer("Received invalid transfer metadata."); return; }
+      if (message.type === "text-message") {
+        if (typeof message.id !== "string" || !message.id || typeof message.text !== "string" || new TextEncoder().encode(message.text).byteLength > 48 * 1024) {
+          console.warn("[DropHut receiver] Ignored invalid text message", { id: message.id });
+          return;
+        }
+        setReceivedTexts((current) => [...current.slice(-29), { id: message.id as string, text: message.text as string }]);
+        console.info("[DropHut receiver] Text message received", { id: message.id, bytes: new TextEncoder().encode(message.text).byteLength });
+        return;
+      }
       if (message.type === "file-cancel") {
         if (incomingFileRef.current?.transferId === message.transferId) {
           console.info("[DropHut receiver] Sender cancelled transfer", { transferId: message.transferId });
@@ -316,7 +348,6 @@ function JoinPipe({ onHome }: JoinPipeProps) {
         if (typeof message.transferId !== "string" || !message.transferId || typeof message.name !== "string" || !message.name || typeof message.mimeType !== "string" || !validSize || !validChunks || message.chunkSize !== CHUNK_SIZE || message.totalChunks !== Math.ceil((message.size as number) / CHUNK_SIZE)) {
           rejectTransfer("The offered file metadata is invalid.", message.transferId); return;
         }
-        if (receivedFileUrlRef.current) { URL.revokeObjectURL(receivedFileUrlRef.current); receivedFileUrlRef.current = null; }
         setReceivedFile(null);
         console.info("[DropHut receiver] Transfer started", { transferId: message.transferId, name: message.name, mimeType: message.mimeType, expectedSize: message.size, totalChunks: message.totalChunks, chunkSize: message.chunkSize });
         setIncomingOffer({ name: message.name, mimeType: message.mimeType, size: message.size as number });
@@ -324,7 +355,6 @@ function JoinPipe({ onHome }: JoinPipeProps) {
         setReceivedBytes(0);
         lastProgressUpdateRef.current = 0;
         setReceiveWarning("The completed file is assembled in browser memory before download. Very large files may exceed available memory.");
-        setDownloadNotice(null);
         setError("");
         setReceiveStatus("receiving");
         armIncomingTimeout(channel, message.transferId as string);
@@ -351,7 +381,7 @@ function JoinPipe({ onHome }: JoinPipeProps) {
           transfer.chunks.length = 0;
           if (incomingTimeoutRef.current !== null) { window.clearTimeout(incomingTimeoutRef.current); incomingTimeoutRef.current = null; }
           incomingFileRef.current = null;
-          receivedFileUrlRef.current = url;
+          retainDownloadedUrl(url);
           retireTransferId(transferId);
           const downloadLink = document.createElement("a");
           downloadLink.href = url;
@@ -389,12 +419,12 @@ function JoinPipe({ onHome }: JoinPipeProps) {
       transfer.receivedBytes += data.byteLength;
       armIncomingTimeout(channel, transfer.transferId);
       const nextChunk = chunkIndex + 1;
+      const now = performance.now();
+      if (nextChunk === transfer.totalChunks || now - lastProgressUpdateRef.current >= 100) {
+        setReceivedBytes(transfer.receivedBytes);
+        lastProgressUpdateRef.current = now;
+      }
       if (nextChunk % ACK_BATCH_SIZE === 0 || nextChunk === transfer.totalChunks) {
-        const now = performance.now();
-        if (nextChunk === transfer.totalChunks || now - lastProgressUpdateRef.current >= 250) {
-          setReceivedBytes(transfer.receivedBytes);
-          lastProgressUpdateRef.current = now;
-        }
         sendTransferControl("chunk-ack", transfer.transferId, { nextChunk });
       }
     } catch (reason) {
@@ -535,7 +565,7 @@ function JoinPipe({ onHome }: JoinPipeProps) {
       reconnectTimerRef.current = null;
       clearTimers();
       closePeerConnection();
-      if (receivedFileUrlRef.current) { URL.revokeObjectURL(receivedFileUrlRef.current); receivedFileUrlRef.current = null; }
+      clearDownloadedUrls();
       const socket = socketRef.current;
       socketRef.current = null;
       if (socket) {
@@ -716,6 +746,12 @@ function JoinPipe({ onHome }: JoinPipeProps) {
             {error && <p className="error-message" role="alert">{error}</p>}
           </>
         )}
+      {receivedTexts.length > 0 && (
+        <div className="received-text-list" aria-live="polite">
+          <h2>Messages from sender</h2>
+          {receivedTexts.map((message) => <article className="received-text-card" key={message.id}>{message.text}</article>)}
+        </div>
+      )}
       {signalingStatus === "reconnecting" && (
         <p className="signaling-note" role="status">
           {status === "connected" ? "Signaling reconnecting; the direct connection is still active." : "Signaling reconnecting; keeping this pipe session available."}

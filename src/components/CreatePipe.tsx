@@ -15,6 +15,7 @@ type PipeMessage = {
 
 type SendStatus = "selecting" | "creating" | "waiting" | "connecting" | "connected" | "transfer";
 type TransferStatus = "idle" | "preparing" | "sending" | "sent" | "error";
+type QueueItem = { id: string; file: File; status: "waiting" | "sending" | "completed" | "failed"; bytesSent: number; error?: string };
 const CHUNK_SIZE = 16 * 1024;
 const BUFFER_LOW_WATER = 256 * 1024;
 const BUFFER_HIGH_WATER = 512 * 1024;
@@ -48,8 +49,23 @@ function formatFileSize(bytes: number) {
   return size.toFixed(size >= 10 ? 0 : 1) + " " + units[unit];
 }
 
+function getTransferClock() { return performance.now(); }
+
+function createLocalId() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  if (typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function") {
+    const values = crypto.getRandomValues(new Uint32Array(4));
+    return Array.from(values, (value) => value.toString(16)).join("");
+  }
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
 function CreatePipe({ onHome }: CreatePipeProps) {
-  const [files, setFiles] = useState<File[]>([]);
+  const [queue, setQueue] = useState<QueueItem[]>([]);
+  const [textDraft, setTextDraft] = useState("");
+  const [queueRunning, setQueueRunning] = useState(false);
+  const queueRunningRef = useRef(false);
+  const files = queue.map((item) => item.file);
   const [code, setCode] = useState("");
   const [status, setStatus] = useState<SendStatus>("selecting");
   const [error, setError] = useState("");
@@ -62,6 +78,9 @@ function CreatePipe({ onHome }: CreatePipeProps) {
   const mountedRef = useRef(false);
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
   const dataChannelRef = useRef<RTCDataChannel | null>(null);
+  const queueRef = useRef<QueueItem[]>([]);
+  const queueCancelledRef = useRef(false);
+  const draggedQueueIdRef = useRef<string | null>(null);
   const transferStatusRef = useRef<TransferStatus>("idle");
   const transferTimeoutRef = useRef<number | null>(null);
   const transferIdRef = useRef<string | null>(null);
@@ -71,6 +90,9 @@ function CreatePipe({ onHome }: CreatePipeProps) {
   const backpressureWaitsRef = useRef(0);
   const lastProgressUpdateRef = useRef(0);
   const transferSequenceRef = useRef(0);
+  const lastAcknowledgedChunkRef = useRef(0);
+  const transferTotalChunksRef = useRef(0);
+  const peerTransferErrorRef = useRef<string | null>(null);
   const fileEndSentRef = useRef(false);
   const transferCancelledRef = useRef(false);
   const cancelWaitRef = useRef<(() => void) | null>(null);
@@ -136,6 +158,7 @@ function CreatePipe({ onHome }: CreatePipeProps) {
     console.info("[DropHut sender] Receiver disconnected", { transferActive, completedTransfer });
 
     if (transferActive) {
+      peerTransferErrorRef.current = "Receiver disconnected during transfer.";
       transferCancelledRef.current = true;
       cancelWaitRef.current?.();
       pendingControlRef.current?.reject(new Error("Receiver disconnected during transfer."));
@@ -164,6 +187,7 @@ function CreatePipe({ onHome }: CreatePipeProps) {
 
   function fail(message: string) {
     console.error("[DropHut sender] Connection failure", { transferId: transferIdRef.current, message });
+    peerTransferErrorRef.current = message;
     transferCancelledRef.current = true;
     cancelWaitRef.current?.();
     pendingControlRef.current?.reject(new Error(message));
@@ -265,46 +289,55 @@ function CreatePipe({ onHome }: CreatePipeProps) {
       if (typeof event.data !== "string") return;
       try {
         const message = JSON.parse(event.data) as { type?: string; transferId?: string; message?: string; nextChunk?: number; size?: number };
-        if (message.transferId && message.transferId === transferIdRef.current) {
-          const pending = pendingControlRef.current;
-          if (pending && message.type === pending.type && pending.nextChunk !== undefined && message.nextChunk !== pending.nextChunk) return;
-          if (pending && message.type === pending.type) {
+        const transferId = transferIdRef.current;
+        if (!transferId || message.transferId !== transferId) return;
+        if (message.type === "receiver-ready") {
+          if (pendingControlRef.current?.type === "receiver-ready") {
+            const pending = pendingControlRef.current;
             pendingControlRef.current = null;
             pending.resolve();
-          } else if (message.type === "chunk-ack" || message.type === "receiver-ready") {
-            return;
-          } else if (message.type === "file-received" && fileEndSentRef.current && transferFileSizeRef.current !== null && message.size === transferFileSizeRef.current) {
-            const durationMs = performance.now() - transferStartedAtRef.current;
-            const mibPerSecond = durationMs > 0 ? message.size / (1024 * 1024) / (durationMs / 1000) : 0;
-            console.info("[DropHut sender] Transfer completed and acknowledged", { transferId: message.transferId, fileSize: message.size, totalChunks: Math.ceil(message.size / CHUNK_SIZE), durationMs: Math.round(durationMs), mibPerSecond: Number(mibPerSecond.toFixed(2)), maxBufferedAmount: maxBufferedAmountRef.current, backpressureWaits: backpressureWaitsRef.current });
-            if (transferTimeoutRef.current !== null) window.clearTimeout(transferTimeoutRef.current);
-            transferTimeoutRef.current = null;
-            pendingControlRef.current = null;
-            transferIdRef.current = null;
-            transferFileSizeRef.current = null;
-            fileEndSentRef.current = false;
-            transferCancelledRef.current = false;
-            transferStatusRef.current = "sent";
-            setTransferStatus("sent");
-          } else if (message.type === "file-error") {
-            transferCancelledRef.current = true;
-            cancelWaitRef.current?.();
-            if (transferTimeoutRef.current !== null) { window.clearTimeout(transferTimeoutRef.current); transferTimeoutRef.current = null; }
-            pendingControlRef.current?.reject(new Error(message.message || "The receiver could not accept this file."));
-            pendingControlRef.current = null;
-            transferStatusRef.current = "error";
-            setTransferStatus("error");
-            setError(message.message || "The receiver could not accept this file.");
-          } else if (message.type === "file-cancelled" && (transferStatusRef.current === "preparing" || transferStatusRef.current === "sending")) cancelLocalTransfer();
-          else if (transferStatusRef.current === "preparing" || transferStatusRef.current === "sending") {
-            pendingControlRef.current?.reject(new Error("Received an unexpected transfer response."));
-            pendingControlRef.current = null;
-            transferCancelledRef.current = true;
-            transferStatusRef.current = "error";
-            setTransferStatus("error");
-            setError("Received an unexpected transfer response.");
           }
+          return;
         }
+        if (message.type === "chunk-ack") {
+          const size = transferFileSizeRef.current;
+          if (size === null || !Number.isSafeInteger(message.nextChunk) || (message.nextChunk as number) <= lastAcknowledgedChunkRef.current || (message.nextChunk as number) > transferTotalChunksRef.current) return;
+          lastAcknowledgedChunkRef.current = message.nextChunk as number;
+          console.debug("[DropHut sender] Receiver acknowledged chunks", { transferId, nextChunk: message.nextChunk, bufferedAmount: dataChannelRef.current?.bufferedAmount ?? 0 });
+          return;
+        }
+        if (message.type === "file-received") {
+          if (!fileEndSentRef.current || transferFileSizeRef.current === null || message.size !== transferFileSizeRef.current) return;
+          if (pendingControlRef.current?.type === "file-received") {
+            const pending = pendingControlRef.current;
+            pendingControlRef.current = null;
+            pending.resolve();
+          }
+          return;
+        }
+        if (message.type === "file-error") {
+          peerTransferErrorRef.current = message.message || "The receiver could not accept this file.";
+          transferCancelledRef.current = true;
+          cancelWaitRef.current?.();
+          const reason = new Error(peerTransferErrorRef.current);
+          pendingControlRef.current?.reject(reason);
+          pendingControlRef.current = null;
+          return;
+        }
+        if (message.type === "file-cancelled") {
+          peerTransferErrorRef.current = "The receiver cancelled this file.";
+          transferCancelledRef.current = true;
+          cancelWaitRef.current?.();
+          pendingControlRef.current?.reject(new Error(peerTransferErrorRef.current));
+          pendingControlRef.current = null;
+          return;
+        }
+        if (message.type === "receiver-ready") return;
+        peerTransferErrorRef.current = "Received an unexpected transfer response.";
+        transferCancelledRef.current = true;
+        cancelWaitRef.current?.();
+        pendingControlRef.current?.reject(new Error(peerTransferErrorRef.current));
+        pendingControlRef.current = null;
       } catch { console.warn("[DropHut sender] Ignored invalid DataChannel response"); }
     };
     channel.onclose = () => {
@@ -451,11 +484,25 @@ function CreatePipe({ onHome }: CreatePipeProps) {
     };
   }, []);
 
+  function updateQueue(update: (current: QueueItem[]) => QueueItem[]) {
+    const next = update(queueRef.current);
+    queueRef.current = next;
+    setQueue(next);
+  }
+
   function selectFiles(fileList: FileList | null) {
-    if (!fileList || statusRef.current !== "selecting") return;
-    const file = fileList[0];
-    if (!file) return;
-    setFiles([file]);
+    if (!fileList) return;
+    const additions = Array.from(fileList);
+    updateQueue((current) => {
+      const next = [...current];
+      for (const file of additions) {
+        const duplicate = next.some((item) => item.file.name === file.name && item.file.size === file.size && item.file.lastModified === file.lastModified);
+        if (duplicate) continue;
+        const id = createLocalId();
+        next.push({ id, file, status: "waiting", bytesSent: 0 });
+      }
+      return next;
+    });
     setError("");
   }
 
@@ -584,7 +631,7 @@ function CreatePipe({ onHome }: CreatePipeProps) {
   }
 
   function createPipe() {
-    if (!files.length || socketRef.current || status === "creating") return;
+    if (socketRef.current || status === "creating") return;
 
     const random = new Uint32Array(1);
     crypto.getRandomValues(random);
@@ -627,35 +674,39 @@ function CreatePipe({ onHome }: CreatePipeProps) {
         window.clearTimeout(pollTimeout);
         if (cancelWaitRef.current === onCancel) cancelWaitRef.current = null;
       };
-      const onLow = () => { cleanup(); resolve(); };
-      const onClose = () => { cleanup(); reject(new Error("The direct connection closed while sending.")); };
-      const onError = () => { cleanup(); reject(new Error("The data channel failed while sending.")); };
-      const onCancel = () => { cleanup(); reject(new Error("Transfer cancelled.")); };
+      const finish = (reason?: Error) => { cleanup(); if (reason) reject(reason); else resolve(); };
+      const onLow = () => finish();
+      const onClose = () => finish(new Error("The direct connection closed while sending."));
+      const onError = () => finish(new Error("The data channel failed while sending."));
+      const onCancel = () => finish(new Error("Transfer cancelled."));
       const resetStallTimeout = () => {
         window.clearTimeout(stallTimeout);
-        stallTimeout = window.setTimeout(() => { cleanup(); reject(new Error("The DataChannel buffer stopped draining.")); }, 5 * 60 * 1000);
+        stallTimeout = window.setTimeout(() => finish(new Error("The DataChannel buffer stopped draining.")), 5 * 60 * 1000);
       };
       const pollBuffer = () => {
         const amount = channel.bufferedAmount;
-        if (amount <= BUFFER_LOW_WATER) { cleanup(); resolve(); return; }
+        if (amount <= BUFFER_LOW_WATER) { finish(); return; }
         if (amount < lastAmount) { lastAmount = amount; resetStallTimeout(); }
-        pollTimeout = window.setTimeout(pollBuffer, 5000);
+        pollTimeout = window.setTimeout(pollBuffer, 250);
       };
       cancelWaitRef.current = onCancel;
       channel.addEventListener("bufferedamountlow", onLow);
       channel.addEventListener("close", onClose);
       channel.addEventListener("error", onError);
       resetStallTimeout();
-      pollTimeout = window.setTimeout(pollBuffer, 5000);
-      if (channel.bufferedAmount <= BUFFER_LOW_WATER) { cleanup(); resolve(); }
+      pollTimeout = window.setTimeout(pollBuffer, 250);
+      if (channel.bufferedAmount <= BUFFER_LOW_WATER) finish();
     });
   }
 
-  function waitForTransferControl(type: string, transferId: string, nextChunk?: number) {
+  function waitForTransferControl(type: string, transferId: string) {
     return new Promise<void>((resolve, reject) => {
-      const timeout = window.setTimeout(() => { pendingControlRef.current = null; reject(new Error("The receiver did not respond. The transfer timed out.")); }, 5 * 60 * 1000);
+      const timeout = window.setTimeout(() => {
+        pendingControlRef.current = null;
+        reject(new Error("The receiver did not confirm the completed file."));
+      }, 5 * 60 * 1000);
       const finish = (callback: () => void) => { window.clearTimeout(timeout); callback(); };
-      pendingControlRef.current = { type, transferId, nextChunk, resolve: () => finish(resolve), reject: (reason) => finish(() => reject(reason)) };
+      pendingControlRef.current = { type, transferId, resolve: () => finish(resolve), reject: (reason) => finish(() => reject(reason)) };
     });
   }
 
@@ -664,97 +715,165 @@ function CreatePipe({ onHome }: CreatePipeProps) {
     console.info("[DropHut sender] Transfer cancelled", { transferId: transferIdRef.current });
     transferCancelledRef.current = true;
     cancelWaitRef.current?.();
-    pendingControlRef.current?.reject(new Error("Transfer cancelled.")); pendingControlRef.current = null;
+    pendingControlRef.current?.reject(new Error("Transfer cancelled."));
+    pendingControlRef.current = null;
     if (transferTimeoutRef.current !== null) { window.clearTimeout(transferTimeoutRef.current); transferTimeoutRef.current = null; }
-    transferIdRef.current = null; transferFileSizeRef.current = null; fileEndSentRef.current = false; transferStatusRef.current = "idle"; setTransferStatus("idle"); setTransferredBytes(0); setError("");
+    transferIdRef.current = null; transferFileSizeRef.current = null; fileEndSentRef.current = false; transferStatusRef.current = "idle";
+    setTransferStatus("idle"); setTransferredBytes(0); setError("");
     setStatus("connected"); statusRef.current = "connected";
-  }
-
-  function prepareAnotherTransfer() {
-    transferStatusRef.current = "idle";
-    transferIdRef.current = null;
-    transferFileSizeRef.current = null;
-    fileEndSentRef.current = false;
-    transferCancelledRef.current = false;
-    setTransferStatus("idle");
-    setTransferredBytes(0);
-    setError("");
-    setStatus("connected");
-    statusRef.current = "connected";
-  }
-
-  function handleNextFileChange(event: ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0];
-    if (file) { setFiles([file]); prepareAnotherTransfer(); }
-    event.target.value = "";
   }
 
   function cancelTransfer() {
     const transferId = transferIdRef.current; const channel = dataChannelRef.current;
+    queueCancelledRef.current = true;
     if (transferId && channel?.readyState === "open") { try { channel.send(JSON.stringify({ type: "file-cancel", transferId })); } catch { /* Local cancellation still proceeds. */ } }
+    updateQueue((current) => current.map((item) => item.status === "sending" ? { ...item, status: "waiting", bytesSent: 0, error: undefined } : item));
     cancelLocalTransfer();
   }
 
-  async function sendFile() {
-    const file = files[0]; const channel = dataChannelRef.current;
-    if (!file || !channel || channel.readyState !== "open" || transferStatusRef.current === "preparing" || transferStatusRef.current === "sending" || transferStatusRef.current === "sent") return;
+  async function sendFile(file: File, queueId: string) {
+    const channel = dataChannelRef.current;
+    if (!channel || channel.readyState !== "open") throw new Error("The direct connection is not open.");
     const peerLimit = peerConnectionRef.current?.sctp?.maxMessageSize;
-    if (peerLimit && peerLimit > 0 && CHUNK_SIZE > peerLimit) { setError("The connection cannot carry the selected chunk size."); return; }
-    const transferId = String(++transferSequenceRef.current);
-    transferIdRef.current = transferId; transferFileSizeRef.current = file.size; fileEndSentRef.current = false; transferCancelledRef.current = false; transferStartedAtRef.current = performance.now(); maxBufferedAmountRef.current = channel.bufferedAmount; backpressureWaitsRef.current = 0; lastProgressUpdateRef.current = 0; setError(""); setTransferredBytes(0);
-    transferStatusRef.current = "preparing"; setTransferStatus("preparing"); setStatus("transfer"); statusRef.current = "transfer";
-    const totalChunks = Math.ceil(file.size / CHUNK_SIZE); const batchSize = 32;
+    if (peerLimit && peerLimit > 0 && CHUNK_SIZE > peerLimit) throw new Error("The connection cannot carry the selected chunk size.");
+    const transferId = `${sessionCodeRef.current ?? "pipe"}-${++transferSequenceRef.current}-${createLocalId()}`;
+    transferIdRef.current = transferId; transferFileSizeRef.current = file.size; fileEndSentRef.current = false; transferCancelledRef.current = false;
+    transferStartedAtRef.current = getTransferClock(); maxBufferedAmountRef.current = channel.bufferedAmount; backpressureWaitsRef.current = 0; lastProgressUpdateRef.current = 0;
+    transferStatusRef.current = "preparing"; setTransferStatus("preparing"); setTransferredBytes(0); setError("");
+    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+    transferTotalChunksRef.current = totalChunks; lastAcknowledgedChunkRef.current = 0; peerTransferErrorRef.current = null;
     console.info("[DropHut sender] Transfer started", { transferId, name: file.name, mimeType: file.type || "application/octet-stream", fileSize: file.size, totalChunks, chunkSize: CHUNK_SIZE });
     try {
       channel.send(JSON.stringify({ type: "file-start", transferId, name: file.name, mimeType: file.type || "application/octet-stream", size: file.size, totalChunks, chunkSize: CHUNK_SIZE }));
-      await waitForTransferControl("receiver-ready", transferId);
-      console.info("[DropHut sender] Receiver ready", { transferId });
-      if (transferCancelledRef.current) return;
+      if (transferCancelledRef.current) throw new Error("Transfer cancelled.");
       transferStatusRef.current = "sending"; setTransferStatus("sending");
+      let sentChunks = 0;
+      let firstChunkDelayMs = 0;
       for (let index = 0; index < totalChunks; index += 1) {
-        if (transferCancelledRef.current) return;
-        if (channel.bufferedAmount > BUFFER_HIGH_WATER) {
+        if (transferCancelledRef.current) throw new Error("Transfer cancelled.");
+        if (dataChannelRef.current !== channel || channel.readyState !== "open") throw new Error("The direct connection closed before the file could be sent.");
+        if (index > 0 && channel.bufferedAmount > BUFFER_HIGH_WATER) {
           backpressureWaitsRef.current += 1;
           await waitForBufferDrain(channel);
         }
-        if (transferCancelledRef.current) return;
-        if (dataChannelRef.current !== channel || channel.readyState !== "open") throw new Error("The direct connection closed before the file could be sent.");
-        const start = index * CHUNK_SIZE;
-        const chunk = file.slice(start, Math.min(start + CHUNK_SIZE, file.size));
-        if (transferCancelledRef.current) return;
-        channel.send(chunk);
+        if (transferCancelledRef.current) throw new Error("Transfer cancelled.");
+        const offset = index * CHUNK_SIZE;
+        channel.send(file.slice(offset, Math.min(offset + CHUNK_SIZE, file.size)));
+        sentChunks = index + 1;
+        if (index === 0) firstChunkDelayMs = getTransferClock() - transferStartedAtRef.current;
         maxBufferedAmountRef.current = Math.max(maxBufferedAmountRef.current, channel.bufferedAmount);
-        const nextChunk = index + 1;
-        if (nextChunk % batchSize === 0 || nextChunk === totalChunks) {
-          await waitForTransferControl("chunk-ack", transferId, nextChunk);
-          const now = performance.now();
-          if (nextChunk === totalChunks || now - lastProgressUpdateRef.current >= 250) {
-            setTransferredBytes(Math.min(file.size, nextChunk * CHUNK_SIZE));
-            lastProgressUpdateRef.current = now;
-          }
+        const sentBytes = Math.min(file.size, sentChunks * CHUNK_SIZE);
+        const now = getTransferClock();
+        if (index === 0 || now - lastProgressUpdateRef.current >= 100) {
+          setTransferredBytes(sentBytes);
+          updateQueue((current) => current.map((item) => item.id === queueId ? { ...item, bytesSent: sentBytes } : item));
+          lastProgressUpdateRef.current = now;
         }
       }
-      if (transferCancelledRef.current) return;
+      if (transferCancelledRef.current) throw new Error("Transfer cancelled.");
       if (dataChannelRef.current !== channel || channel.readyState !== "open") throw new Error("The direct connection closed before the file could be completed.");
       channel.send(JSON.stringify({ type: "file-end", transferId, totalChunks, size: file.size }));
       fileEndSentRef.current = true;
-      console.info("[DropHut sender] Sent file-end", { transferId, totalChunks, size: file.size });
-      transferTimeoutRef.current = window.setTimeout(() => { if (transferStatusRef.current === "sending") { transferStatusRef.current = "error"; setTransferStatus("error"); setError("The receiver did not confirm the completed file."); } }, 5 * 60 * 1000);
+      console.info("[DropHut sender] Sent all chunks and file-end", { transferId, totalChunks, size: file.size, firstChunkDelayMs: Math.round(firstChunkDelayMs), maxBufferedAmount: maxBufferedAmountRef.current, backpressureWaits: backpressureWaitsRef.current });
+      await waitForTransferControl("file-received", transferId);
+      if (transferCancelledRef.current || transferIdRef.current !== transferId) throw new Error("Transfer cancelled.");
+      const durationMs = getTransferClock() - transferStartedAtRef.current;
+      const mibPerSecond = durationMs > 0 ? file.size / (1024 * 1024) / (durationMs / 1000) : 0;
+      console.info("[DropHut sender] Transfer completed and acknowledged", { transferId, fileSize: file.size, totalChunks, durationMs: Math.round(durationMs), mibPerSecond: Number(mibPerSecond.toFixed(2)), maxBufferedAmount: maxBufferedAmountRef.current, backpressureWaits: backpressureWaitsRef.current });
+      if (transferTimeoutRef.current !== null) { window.clearTimeout(transferTimeoutRef.current); transferTimeoutRef.current = null; }
+      pendingControlRef.current = null; transferIdRef.current = null; transferFileSizeRef.current = null; fileEndSentRef.current = false; transferCancelledRef.current = false;
+      transferStatusRef.current = "sent"; setTransferStatus("sent");
     } catch (reason) {
-      if (transferCancelledRef.current) return;
-      console.error("[DropHut sender] Transfer failed", { transferId, reason });
-      if (dataChannelRef.current === channel && channel.readyState === "open") {
-        try { channel.send(JSON.stringify({ type: "file-cancel", transferId })); } catch { /* Connection may already be closed. */ }
+      if (transferTimeoutRef.current !== null) { window.clearTimeout(transferTimeoutRef.current); transferTimeoutRef.current = null; }
+      const activeTransferId = transferIdRef.current;
+      if (activeTransferId && dataChannelRef.current === channel && channel.readyState === "open") {
+        try { channel.send(JSON.stringify({ type: "file-cancel", transferId: activeTransferId })); } catch { /* Receiver cleanup is best effort after a local failure. */ }
       }
-      transferStatusRef.current = "error"; setTransferStatus("error"); setError(reason instanceof Error ? reason.message : "Could not send the file.");
+      pendingControlRef.current?.reject(reason instanceof Error ? reason : new Error("Transfer failed."));
+      pendingControlRef.current = null; transferIdRef.current = null; transferFileSizeRef.current = null; transferTotalChunksRef.current = 0; fileEndSentRef.current = false;
+      const failure = peerTransferErrorRef.current; peerTransferErrorRef.current = null;
+      throw failure ? new Error(failure) : reason;
     }
   }
 
-  function showTransferNotice() {
-    setStatus("transfer");
-    statusRef.current = "transfer";
-    void sendFile();
+  async function sendQueue() {
+    const channel = dataChannelRef.current;
+    if (queueRunningRef.current || !queueRef.current.some((item) => item.status === "waiting") || !channel || channel.readyState !== "open") return;
+    queueRunningRef.current = true;
+    queueCancelledRef.current = false;
+    setQueueRunning(true); setError(""); setStatus("transfer"); statusRef.current = "transfer";
+    const pending = queueRef.current.filter((item) => item.status === "waiting");
+    for (const item of pending) {
+      if (queueCancelledRef.current) break;
+      if (dataChannelRef.current !== channel || channel.readyState !== "open") { setError("The direct connection closed. Waiting files remain in the queue."); break; }
+      updateQueue((current) => current.map((entry) => entry.id === item.id ? { ...entry, status: "sending", bytesSent: 0, error: undefined } : entry));
+      try {
+        await sendFile(item.file, item.id);
+        updateQueue((current) => current.map((entry) => entry.id === item.id ? { ...entry, status: "completed", bytesSent: entry.file.size, error: undefined } : entry));
+      } catch (reason) {
+        const message = reason instanceof Error ? reason.message : "Could not send this file.";
+        console.error("[DropHut sender] Queue item failed", { name: item.file.name, message });
+        if (!queueCancelledRef.current) {
+          updateQueue((current) => current.map((entry) => entry.id === item.id ? { ...entry, status: "failed", error: message } : entry));
+          setError(`${item.file.name}: ${message}`);
+        }
+        if (queueCancelledRef.current || channel.readyState !== "open") break;
+      }
+    }
+    queueRunningRef.current = false;
+    setQueueRunning(false);
+    const allComplete = queueRef.current.length > 0 && queueRef.current.every((item) => item.status === "completed");
+    if (allComplete) { transferStatusRef.current = "sent"; setTransferStatus("sent"); setError(""); }
+    else if (!queueCancelledRef.current) { transferStatusRef.current = queueRef.current.some((item) => item.status === "failed") ? "error" : "idle"; setTransferStatus(transferStatusRef.current); }
   }
+
+  function retryFailedFiles() {
+    updateQueue((current) => current.map((item) => item.status === "failed" ? { ...item, status: "waiting", bytesSent: 0, error: undefined } : item));
+    setError("");
+    transferStatusRef.current = "idle"; setTransferStatus("idle");
+  }
+
+  async function sendTextMessage() {
+    const channel = dataChannelRef.current;
+    const text = textDraft.trim();
+    if (!text || !channel || channel.readyState !== "open" || queueRunning) return;
+    const byteLength = new TextEncoder().encode(text).byteLength;
+    if (byteLength > 48 * 1024) { setError("Text messages must be 48 KB or smaller."); return; }
+    const message = JSON.stringify({ type: "text-message", id: createLocalId(), text });
+    const messageBytes = new TextEncoder().encode(message).byteLength;
+    const maxMessageSize = peerConnectionRef.current?.sctp?.maxMessageSize || 64 * 1024;
+    if (messageBytes > Math.min(48 * 1024, maxMessageSize)) { setError("This text message is too large to send in one DataChannel message."); return; }
+    try {
+      if (channel.bufferedAmount > BUFFER_HIGH_WATER) await waitForBufferDrain(channel);
+      if (dataChannelRef.current !== channel || channel.readyState !== "open") throw new Error("The direct connection is not open.");
+      channel.send(message);
+      setTextDraft(""); setError("");
+      console.info("[DropHut sender] Text message sent", { bytes: byteLength });
+    } catch (reason) { setError(reason instanceof Error ? reason.message : "Could not send the text message."); }
+  }
+
+  function removeQueuedFile(id: string) {
+    updateQueue((current) => current.filter((item) => item.id !== id || item.status !== "waiting"));
+  }
+
+  function reorderQueuedFile(targetId: string) {
+    const sourceId = draggedQueueIdRef.current; draggedQueueIdRef.current = null;
+    if (!sourceId || sourceId === targetId) return;
+    updateQueue((current) => {
+      const from = current.findIndex((item) => item.id === sourceId && item.status === "waiting");
+      const to = current.findIndex((item) => item.id === targetId && item.status === "waiting");
+      if (from < 0 || to < 0) return current;
+      const next = [...current]; const [moved] = next.splice(from, 1); next.splice(to, 0, moved); return next;
+    });
+  }
+
+  function handleQueueFileChange(event: ChangeEvent<HTMLInputElement>) {
+    selectFiles(event.target.files); event.target.value = "";
+  }
+
+  const totalQueueBytes = queue.reduce((total, item) => total + item.file.size, 0);
+  const completedQueueBytes = queue.reduce((total, item) => total + (item.status === "completed" ? item.file.size : item.status === "sending" ? transferredBytes : 0), 0);
+  const overallQueuePercent = totalQueueBytes > 0 ? Math.min(100, Math.floor(completedQueueBytes / totalQueueBytes * 100)) : 0;
 
   return (
     <main className="app-shell flow-shell">
@@ -780,29 +899,36 @@ function CreatePipe({ onHome }: CreatePipeProps) {
               <div className="upload-card-copy">
                 <span className="upload-eyebrow">SEND FILES</span>
                 <strong>Drop your files here</strong>
-                <span className="upload-support">or choose a file from your device</span>
+                <span className="upload-support">or choose files from your device</span>
               </div>
               <div className="upload-card-action">
                 <label htmlFor="file-picker" className="upload-browse-button">Browse files <span aria-hidden="true">↗</span></label>
-                <span className="upload-limit-note">Any file type <i aria-hidden="true">·</i> One file at a time</span>
+                <span className="upload-limit-note">Any file type <i aria-hidden="true">·</i> Multiple files</span>
               </div>
-              <input id="file-picker" className="visually-hidden" type="file" onChange={handleFileChange} />
+              <input id="file-picker" className="visually-hidden" type="file" multiple onChange={handleFileChange} />
             </div>
-            {files.length > 0 && (
-              <div className="file-panel">
-                <div className="section-heading"><h2>File</h2><span>1 file selected</span></div>
-                <ul className="file-list">
-                  {files.map((file, index) => (
-                    <li className="file-row" key={file.name + file.lastModified + index}>
-                      <span className="file-icon" aria-hidden="true">↗</span>
-                      <span className="file-name">{file.name}</span>
-                      <span className="file-size">{formatFileSize(file.size)}</span>
+            {queue.length > 0 ? (
+              <div className="file-panel transfer-queue-panel">
+                <div className="section-heading"><h2>Transfer Queue</h2><span>{queue.length} {queue.length === 1 ? "file" : "files"}</span></div>
+                <ol className="transfer-queue-list">
+                  {queue.map((item, index) => (
+                    <li className="transfer-queue-item" key={item.id} draggable={item.status === "waiting"} onDragStart={(event) => { draggedQueueIdRef.current = item.id; event.dataTransfer.effectAllowed = "move"; }} onDragOver={(event) => { if (item.status === "waiting") event.preventDefault(); }} onDrop={(event) => { event.preventDefault(); reorderQueuedFile(item.id); }} onDragEnd={() => { draggedQueueIdRef.current = null; }}>
+                      <span className="queue-position">{index + 1}</span>
+                      <span className="queue-file-icon" aria-hidden="true">{item.file.type.startsWith("image/") ? "▧" : item.file.type.startsWith("video/") ? "▶" : "↗"}</span>
+                      <span className="queue-file-info"><strong>{item.file.name}</strong><small>{formatFileSize(item.file.size)} · {item.file.type || "File"}</small></span>
+                      <span className={`queue-file-status ${item.status}`} title={item.error}>{item.status === "waiting" ? "Waiting" : item.status === "sending" ? "Sending" : item.status === "completed" ? "Completed" : "Failed"}</span>
+                      <span className="queue-grip" title={item.status === "waiting" ? "Drag to reorder" : undefined} aria-hidden="true">{item.status === "waiting" ? "⠿" : item.status === "completed" ? "✓" : item.status === "failed" ? "!" : "•••"}</span>{item.status === "waiting" ? <button className="queue-remove" type="button" aria-label={`Remove ${item.file.name}`} onClick={() => removeQueuedFile(item.id)}>×</button> : null}
                     </li>
                   ))}
-                </ul>
+                </ol>
                 <button className="button button-primary button-full" onClick={createPipe} disabled={status === "creating"}>
                   {status === "creating" ? "Creating your pipe…" : "Create Pipe"}
                 </button>
+              </div>
+            ) : (
+              <div className="file-panel empty-queue-prompt">
+                <p className="pipe-hint">You can add files after the receiver connects.</p>
+                <button className="button button-primary button-full" onClick={createPipe} disabled={status === "creating"}>{status === "creating" ? "Creating your pipe…" : "Create Pipe"}</button>
               </div>
             )}
           </div>
@@ -820,28 +946,39 @@ function CreatePipe({ onHome }: CreatePipeProps) {
           </div>
         )}
 
-        {status === "connected" && (
-          <div className="pipe-card connected-card">
+        {(status === "connected" || status === "transfer") && (
+          <div className="pipe-card connected-card transfer-workspace">
             <div className="connected-label"><span className="status-dot" />Connected ✓</div>
-            <p className="file-count large-count">{files.length} {files.length === 1 ? "file" : "files"} ready</p>
-            <ul className="compact-file-list">
-              {files.map((file, index) => <li key={file.name + file.lastModified + index}>{file.name}<span>{formatFileSize(file.size)}</span></li>)}
-            </ul>
-            <button className="button button-primary button-full" onClick={showTransferNotice}>Send</button>
-          </div>
-        )}
-
-        {status === "transfer" && (
-          <div className="pipe-card transfer-card">
-            <div className="connected-label"><span className="status-dot" />Connected ✓</div>
-            <h2>{transferStatus === "sending" ? "Sending file…" : transferStatus === "sent" ? "File sent ✓" : transferStatus === "error" ? "Send failed" : "Ready to send"}</h2>
-            <p>{files[0]?.name} · {formatFileSize(files[0]?.size ?? 0)}</p>
-            {(transferStatus === "preparing" || transferStatus === "sending") && <p>{formatFileSize(transferredBytes)} / {formatFileSize(files[0]?.size ?? 0)} · {files[0]?.size ? Math.floor(transferredBytes / files[0].size * 100) : 0}%</p>}
-            {transferStatus === "preparing" && <p>Waiting for receiver to get ready…</p>}
-            {(transferStatus === "preparing" || transferStatus === "sending") && <button className="button button-secondary button-full" onClick={cancelTransfer}>Cancel transfer</button>}
-            {transferStatus === "idle" && <button className="button button-primary button-full" onClick={sendFile}>Send file</button>}
-            {transferStatus === "sent" && <><p>The receiver confirmed the file.</p><button className="button button-primary button-full" onClick={prepareAnotherTransfer}>Send another</button><label className="button button-secondary button-full" htmlFor="next-file-picker">Choose another file</label><input id="next-file-picker" className="visually-hidden" type="file" onChange={handleNextFileChange} /></>}
-            <button className="button button-secondary button-full" onClick={() => { setStatus("connected"); statusRef.current = "connected"; }}>Back</button>
+            <div className="section-heading queue-section-heading"><h2>Transfer Queue</h2><span>{queue.filter((item) => item.status === "completed").length} / {queue.length} completed</span></div>
+            <ol className="transfer-queue-list active-queue-list">
+              {queue.map((item, index) => (
+                <li className={`transfer-queue-item ${item.status === "sending" ? "is-active" : ""}`} key={item.id} draggable={item.status === "waiting"} onDragStart={(event) => { draggedQueueIdRef.current = item.id; event.dataTransfer.effectAllowed = "move"; }} onDragOver={(event) => { if (item.status === "waiting") event.preventDefault(); }} onDrop={(event) => { event.preventDefault(); reorderQueuedFile(item.id); }} onDragEnd={() => { draggedQueueIdRef.current = null; }}>
+                  <span className="queue-position">{index + 1}</span>
+                  <span className="queue-file-icon" aria-hidden="true">{item.file.type.startsWith("image/") ? "▧" : item.file.type.startsWith("video/") ? "▶" : "↗"}</span>
+                  <span className="queue-file-info"><strong>{item.file.name}</strong><small>{formatFileSize(item.file.size)} · {item.status === "sending" ? `${formatFileSize(item.bytesSent)} sent` : item.file.type || "File"}</small>{item.status === "failed" && item.error && <small className="queue-file-error">{item.error}</small>}{item.status === "sending" && <span className="queue-progress-track"><i style={{ width: `${item.file.size ? Math.min(100, item.bytesSent / item.file.size * 100) : 100}%` }} /></span>}</span>
+                  <span className={`queue-file-status ${item.status}`}>{item.status === "waiting" ? "Waiting" : item.status === "sending" ? "Sending" : item.status === "completed" ? "Completed" : "Failed"}</span>
+                  <span className="queue-grip" title={item.status === "waiting" ? "Drag to reorder" : undefined} aria-hidden="true">{item.status === "waiting" ? "⠿" : item.status === "completed" ? "✓" : item.status === "failed" ? "!" : "•••"}</span>{item.status === "waiting" ? <button className="queue-remove" type="button" aria-label={`Remove ${item.file.name}`} onClick={() => removeQueuedFile(item.id)}>×</button> : null}
+                </li>
+              ))}
+            </ol>
+            <div className="queue-overall-progress">
+              <span>Overall progress</span>
+              <strong>{formatFileSize(completedQueueBytes)} / {formatFileSize(totalQueueBytes)} · {overallQueuePercent}%</strong>
+            </div>
+            <div className="queue-progress-track overall"><i style={{ width: `${overallQueuePercent}%` }} /></div>
+            <div className="queue-actions">
+              <label className="button button-secondary queue-add-button" htmlFor="queue-file-picker">+ Add files</label>
+              <input id="queue-file-picker" className="visually-hidden" type="file" multiple onChange={handleQueueFileChange} />
+              <button className="button button-primary queue-send-button" onClick={() => { void sendQueue(); }} disabled={queueRunning || !queue.some((item) => item.status === "waiting")}>{queueRunning ? "Sending queue…" : "Send queue"}</button>
+            </div>
+            {queueRunning && <button className="button button-secondary button-full" onClick={cancelTransfer}>Cancel current file</button>}
+            {queue.some((item) => item.status === "failed") && !queueRunning && <button className="button button-secondary button-full" onClick={retryFailedFiles}>Retry failed files</button>}
+            {transferStatus === "sent" && queue.every((item) => item.status === "completed") && <p className="queue-success">All queued files were received successfully ✓</p>}
+            <div className="text-share-box">
+              <label htmlFor="text-share-input">Send a text message <span>Up to 48 KB</span></label>
+              <textarea id="text-share-input" value={textDraft} onChange={(event) => setTextDraft(event.target.value)} maxLength={48 * 1024} placeholder="Write a message to the receiver…" disabled={queueRunning} />
+              <button className="button button-secondary button-full" onClick={() => { void sendTextMessage(); }} disabled={queueRunning || !textDraft.trim()}>Send text</button>
+            </div>
           </div>
         )}
 
@@ -852,7 +989,7 @@ function CreatePipe({ onHome }: CreatePipeProps) {
           </p>
         )}
       </section>
-      <p className="privacy-note">Files are sent directly to the receiver. One file is sent in 16 KB chunks.</p>
+      <p className="privacy-note">Files are sent directly to the receiver, one at a time in 16 KB chunks.</p>
     </main>
   );
 }
