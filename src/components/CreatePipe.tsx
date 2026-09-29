@@ -17,6 +17,9 @@ type SendStatus = "selecting" | "creating" | "waiting" | "connecting" | "connect
 type TransferStatus = "idle" | "preparing" | "sending" | "sent" | "error";
 type QueueItem = { id: string; file: File; status: "waiting" | "sending" | "completed" | "failed"; bytesSent: number; error?: string };
 const CHUNK_SIZE = 16 * 1024;
+const SEND_WINDOW_CHUNKS = 8;
+const ACK_TIMEOUT_MS = 20_000;
+const ACK_RETRIES = 2;
 const BUFFER_LOW_WATER = 256 * 1024;
 const BUFFER_HIGH_WATER = 512 * 1024;
 // Binary chunk frame: uint16 ID length, uint32 chunk index, UTF-8 transfer ID, then raw file bytes.
@@ -80,6 +83,8 @@ function CreatePipe({ onHome }: CreatePipeProps) {
   const mountedRef = useRef(false);
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
   const dataChannelRef = useRef<RTCDataChannel | null>(null);
+  const receiverReadyRef = useRef(false);
+  const receiverReadyWaitRef = useRef<{ channel: RTCDataChannel; resolve: () => void; reject: (reason: Error) => void; timeout: number } | null>(null);
   const queueRef = useRef<QueueItem[]>([]);
   const queueCancelledRef = useRef(false);
   const draggedQueueIdRef = useRef<string | null>(null);
@@ -94,6 +99,7 @@ function CreatePipe({ onHome }: CreatePipeProps) {
   const transferSequenceRef = useRef(0);
   const lastAcknowledgedChunkRef = useRef(0);
   const transferTotalChunksRef = useRef(0);
+  const highestSentChunkRef = useRef(0);
   const peerTransferErrorRef = useRef<string | null>(null);
   const fileEndSentRef = useRef(false);
   const transferCancelledRef = useRef(false);
@@ -126,6 +132,14 @@ function CreatePipe({ onHome }: CreatePipeProps) {
   }
 
   function closePeerConnection() {
+    const readyChannel = dataChannelRef.current;
+    receiverReadyRef.current = false;
+    const readyWait = receiverReadyWaitRef.current;
+    if (readyChannel && readyWait?.channel === readyChannel) {
+      window.clearTimeout(readyWait.timeout);
+      receiverReadyWaitRef.current = null;
+      readyWait.reject(new Error("The direct connection closed while waiting for the receiver to be ready."));
+    }
     if (channelErrorTimeoutRef.current !== null) window.clearTimeout(channelErrorTimeoutRef.current);
     channelErrorTimeoutRef.current = null;
     const channel = dataChannelRef.current;
@@ -282,6 +296,9 @@ function CreatePipe({ onHome }: CreatePipeProps) {
   }
 
   function setupDataChannel(channel: RTCDataChannel) {
+    receiverReadyRef.current = false;
+    const previousReadyWait = receiverReadyWaitRef.current;
+    if (previousReadyWait) { window.clearTimeout(previousReadyWait.timeout); receiverReadyWaitRef.current = null; previousReadyWait.reject(new Error("The direct connection changed before the receiver was ready.")); }
     dataChannelRef.current = channel;
     console.info("[DropHut sender] DataChannel created", channel.label, channel.readyState);
     remotePeerDisconnectedRef.current = false;
@@ -291,21 +308,30 @@ function CreatePipe({ onHome }: CreatePipeProps) {
       if (typeof event.data !== "string") return;
       try {
         const message = JSON.parse(event.data) as { type?: string; transferId?: string; message?: string; nextChunk?: number; size?: number };
-        const transferId = transferIdRef.current;
-        if (!transferId || message.transferId !== transferId) return;
         if (message.type === "receiver-ready") {
-          if (pendingControlRef.current?.type === "receiver-ready") {
-            const pending = pendingControlRef.current;
-            pendingControlRef.current = null;
+          if (dataChannelRef.current !== channel || channel.readyState !== "open") return;
+          receiverReadyRef.current = true;
+          console.info("[DropHut sender] Receiver is ready");
+          const pending = receiverReadyWaitRef.current;
+          if (pending?.channel === channel) {
+            window.clearTimeout(pending.timeout);
+            receiverReadyWaitRef.current = null;
             pending.resolve();
           }
           return;
         }
+        const transferId = transferIdRef.current;
+        if (!transferId || message.transferId !== transferId) return;
         if (message.type === "chunk-ack") {
-          const size = transferFileSizeRef.current;
-          if (size === null || !Number.isSafeInteger(message.nextChunk) || (message.nextChunk as number) <= lastAcknowledgedChunkRef.current || (message.nextChunk as number) > transferTotalChunksRef.current) return;
-          lastAcknowledgedChunkRef.current = message.nextChunk as number;
-          console.debug("[DropHut sender] Receiver acknowledged chunks", { transferId, nextChunk: message.nextChunk, bufferedAmount: dataChannelRef.current?.bufferedAmount ?? 0 });
+          const acknowledged = message.nextChunk;
+          if (transferFileSizeRef.current === null || !Number.isSafeInteger(acknowledged) || (acknowledged as number) <= lastAcknowledgedChunkRef.current || (acknowledged as number) > highestSentChunkRef.current) return;
+          lastAcknowledgedChunkRef.current = acknowledged as number;
+          console.info("[DropHut sender] Cumulative chunk ACK received", { transferId, nextChunk: acknowledged, totalChunks: transferTotalChunksRef.current, bufferedAmount: dataChannelRef.current?.bufferedAmount ?? 0 });
+          const pending = pendingControlRef.current;
+          if (pending?.type === "chunk-ack" && pending.transferId === transferId && pending.nextChunk !== undefined && (acknowledged as number) >= pending.nextChunk) {
+            pendingControlRef.current = null;
+            pending.resolve();
+          }
           return;
         }
         if (message.type === "file-received") {
@@ -341,7 +367,6 @@ function CreatePipe({ onHome }: CreatePipeProps) {
           pendingControlRef.current = null;
           return;
         }
-        if (message.type === "receiver-ready") return;
         peerTransferErrorRef.current = "Received an unexpected transfer response.";
         transferCancelledRef.current = true;
         cancelWaitRef.current?.();
@@ -351,12 +376,14 @@ function CreatePipe({ onHome }: CreatePipeProps) {
     };
     channel.onclose = () => {
       console.info("[DropHut sender] DataChannel state: closed");
+      rejectReceiverReadyWait(channel, "The direct connection closed while waiting for the receiver to be ready.");
       if (dataChannelRef.current !== channel) return;
       if (channelErrorTimeoutRef.current !== null) return;
       handlePeerDisconnected();
     };
     channel.onerror = (event) => {
       console.error("[DropHut sender] DataChannel error", event);
+      rejectReceiverReadyWait(channel, "The DataChannel encountered an error while waiting for the receiver to be ready.");
       if (dataChannelRef.current !== channel) return;
       const peer = peerConnectionRef.current;
       if (peer?.connectionState === "failed") {
@@ -708,17 +735,55 @@ function CreatePipe({ onHome }: CreatePipeProps) {
     });
   }
 
-  function waitForTransferControl(type: string, transferId: string) {
+  function rejectReceiverReadyWait(channel: RTCDataChannel, message: string) {
+    receiverReadyRef.current = false;
+    const pending = receiverReadyWaitRef.current;
+    if (!pending || pending.channel !== channel) return;
+    window.clearTimeout(pending.timeout);
+    receiverReadyWaitRef.current = null;
+    pending.reject(new Error(message));
+  }
+
+  function waitForReceiverReady(channel: RTCDataChannel): Promise<void> {
+    if (receiverReadyRef.current) return Promise.resolve();
+    if (dataChannelRef.current !== channel || channel.readyState !== "open") return Promise.reject(new Error("The direct connection closed before the receiver was ready."));
+    console.info("[DropHut sender] Waiting for receiver-ready");
     return new Promise<void>((resolve, reject) => {
       const timeout = window.setTimeout(() => {
-        pendingControlRef.current = null;
-        reject(new Error("The receiver did not confirm the completed file."));
-      }, 5 * 60 * 1000);
+        if (receiverReadyWaitRef.current?.channel === channel) receiverReadyWaitRef.current = null;
+        reject(new Error("Timed out waiting for the receiver to become ready. Please try again."));
+      }, 30_000);
+      receiverReadyWaitRef.current = { channel, resolve: () => { window.clearTimeout(timeout); receiverReadyWaitRef.current = null; resolve(); }, reject: (reason) => { window.clearTimeout(timeout); receiverReadyWaitRef.current = null; reject(reason); }, timeout };
+      if (receiverReadyRef.current && receiverReadyWaitRef.current?.channel === channel) {
+        window.clearTimeout(timeout);
+        receiverReadyWaitRef.current = null;
+        resolve();
+      }
+    });
+  }
+  function waitForTransferControl(type: string, transferId: string, nextChunk?: number, timeoutMs = ACK_TIMEOUT_MS) {
+    return new Promise<void>((resolve, reject) => {
       const finish = (callback: () => void) => { window.clearTimeout(timeout); callback(); };
-      pendingControlRef.current = { type, transferId, resolve: () => finish(resolve), reject: (reason) => finish(() => reject(reason)) };
+      const pending = { type, transferId, nextChunk, resolve: () => finish(resolve), reject: (reason: Error) => finish(() => reject(reason)) };
+      const timeout = window.setTimeout(() => {
+        if (pendingControlRef.current === pending) pendingControlRef.current = null;
+        reject(new Error(type === "chunk-ack" ? "Timed out waiting for chunk ACK at " + nextChunk + "." : "Timed out waiting for the receiver to confirm the completed file."));
+      }, timeoutMs);
+      pendingControlRef.current = pending;
     });
   }
 
+  async function waitForChunkAck(channel: RTCDataChannel, transferId: string, nextChunk: number) {
+    if (lastAcknowledgedChunkRef.current >= nextChunk) return;
+    for (let attempt = 0; attempt <= ACK_RETRIES; attempt += 1) {
+      try { await waitForTransferControl("chunk-ack", transferId, nextChunk); return; }
+      catch (reason) {
+        if (transferCancelledRef.current || peerTransferErrorRef.current || attempt === ACK_RETRIES || channel.readyState !== "open") throw reason;
+        console.warn("[DropHut sender] Chunk ACK timed out; requesting cumulative ACK", { transferId, expectedNextChunk: nextChunk, retry: attempt + 1, bufferedAmount: channel.bufferedAmount });
+        channel.send(JSON.stringify({ type: "chunk-sync", transferId, expectedNextChunk: nextChunk }));
+      }
+    }
+  }
   function cancelLocalTransfer() {
     if (transferCancelledRef.current && transferStatusRef.current === "idle") return;
     console.info("[DropHut sender] Transfer cancelled", { transferId: transferIdRef.current });
@@ -743,6 +808,9 @@ function CreatePipe({ onHome }: CreatePipeProps) {
   async function sendFile(file: File, queueId: string) {
     const channel = dataChannelRef.current;
     if (!channel || channel.readyState !== "open") throw new Error("The direct connection is not open.");
+    await waitForReceiverReady(channel);
+    if (dataChannelRef.current !== channel || channel.readyState !== "open") throw new Error("The direct connection closed before the receiver was ready.");
+    console.info("[DropHut sender] Starting file transfer", { name: file.name, size: file.size });
     const transferId = `${sessionCodeRef.current ?? "pipe"}-${++transferSequenceRef.current}-${createLocalId()}`;
     const transferIdBytes = new TextEncoder().encode(transferId);
     const chunkHeaderLength = CHUNK_FRAME_HEADER_BYTES + transferIdBytes.byteLength;
@@ -754,7 +822,7 @@ function CreatePipe({ onHome }: CreatePipeProps) {
     transferStartedAtRef.current = getTransferClock(); maxBufferedAmountRef.current = channel.bufferedAmount; backpressureWaitsRef.current = 0; lastProgressUpdateRef.current = 0;
     transferStatusRef.current = "preparing"; setTransferStatus("preparing"); setTransferredBytes(0); setError("");
     const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
-    transferTotalChunksRef.current = totalChunks; lastAcknowledgedChunkRef.current = 0; peerTransferErrorRef.current = null;
+    transferTotalChunksRef.current = totalChunks; lastAcknowledgedChunkRef.current = 0; highestSentChunkRef.current = 0; peerTransferErrorRef.current = null;
     console.info("[DropHut sender] Transfer started", { transferId, name: file.name, mimeType: file.type || "application/octet-stream", fileSize: file.size, totalChunks, chunkSize: CHUNK_SIZE });
     try {
       channel.send(JSON.stringify({ type: "file-start", transferId, name: file.name, mimeType: file.type || "application/octet-stream", size: file.size, totalChunks, chunkSize: CHUNK_SIZE }));
@@ -762,45 +830,47 @@ function CreatePipe({ onHome }: CreatePipeProps) {
       transferStatusRef.current = "sending"; setTransferStatus("sending");
       let sentChunks = 0;
       let firstChunkDelayMs = 0;
-      for (let index = 0; index < totalChunks; index += 1) {
-        if (transferCancelledRef.current) throw new Error("Transfer cancelled.");
-        if (dataChannelRef.current !== channel || channel.readyState !== "open") throw new Error("The direct connection closed before the file could be sent.");
-        if (index > 0 && channel.bufferedAmount > BUFFER_HIGH_WATER) {
-          backpressureWaitsRef.current += 1;
-          await waitForBufferDrain(channel);
+      highestSentChunkRef.current = 0;
+      for (let batchStart = 0; batchStart < totalChunks; batchStart += SEND_WINDOW_CHUNKS) {
+        const batchEnd = Math.min(totalChunks, batchStart + SEND_WINDOW_CHUNKS);
+        for (let index = batchStart; index < batchEnd; index += 1) {
+          if (transferCancelledRef.current) throw new Error("Transfer cancelled.");
+          if (dataChannelRef.current !== channel || channel.readyState !== "open") throw new Error("The direct connection closed before the file could be sent.");
+          if (channel.bufferedAmount > BUFFER_HIGH_WATER) { backpressureWaitsRef.current += 1; console.debug("[DropHut sender] Waiting for DataChannel backpressure", { transferId, bufferedAmount: channel.bufferedAmount, highWaterMark: BUFFER_HIGH_WATER }); await waitForBufferDrain(channel); }
+          if (transferCancelledRef.current) throw new Error("Transfer cancelled.");
+          const offset = index * CHUNK_SIZE;
+          const chunkHeader = new Uint8Array(chunkHeaderLength);
+          const headerView = new DataView(chunkHeader.buffer);
+          headerView.setUint16(0, transferIdBytes.byteLength);
+          headerView.setUint32(2, index);
+          chunkHeader.set(transferIdBytes, CHUNK_FRAME_HEADER_BYTES);
+          const chunkPayload = file.slice(offset, Math.min(offset + CHUNK_SIZE, file.size));
+          channel.send(new Blob([chunkHeader, chunkPayload], { type: "application/octet-stream" }));
+          sentChunks = index + 1;
+          highestSentChunkRef.current = sentChunks;
+          if (index === 0) firstChunkDelayMs = getTransferClock() - transferStartedAtRef.current;
+          maxBufferedAmountRef.current = Math.max(maxBufferedAmountRef.current, channel.bufferedAmount);
+          const sentBytes = Math.min(file.size, sentChunks * CHUNK_SIZE);
+          const now = getTransferClock();
+          if (index === 0 || now - lastProgressUpdateRef.current >= 100) { setTransferredBytes(sentBytes); updateQueue((current) => current.map((item) => item.id === queueId ? { ...item, bytesSent: sentBytes } : item)); lastProgressUpdateRef.current = now; }
         }
-        if (transferCancelledRef.current) throw new Error("Transfer cancelled.");
-        const offset = index * CHUNK_SIZE;
-        const chunkHeader = new Uint8Array(chunkHeaderLength);
-        const headerView = new DataView(chunkHeader.buffer);
-        headerView.setUint16(0, transferIdBytes.byteLength);
-        headerView.setUint32(2, index);
-        chunkHeader.set(transferIdBytes, CHUNK_FRAME_HEADER_BYTES);
-        const chunkPayload = file.slice(offset, Math.min(offset + CHUNK_SIZE, file.size));
-        channel.send(new Blob([chunkHeader, chunkPayload], { type: "application/octet-stream" }));
-        sentChunks = index + 1;
-        if (index === 0) firstChunkDelayMs = getTransferClock() - transferStartedAtRef.current;
-        maxBufferedAmountRef.current = Math.max(maxBufferedAmountRef.current, channel.bufferedAmount);
-        const sentBytes = Math.min(file.size, sentChunks * CHUNK_SIZE);
-        const now = getTransferClock();
-        if (index === 0 || now - lastProgressUpdateRef.current >= 100) {
-          setTransferredBytes(sentBytes);
-          updateQueue((current) => current.map((item) => item.id === queueId ? { ...item, bytesSent: sentBytes } : item));
-          lastProgressUpdateRef.current = now;
-        }
+        console.info("[DropHut sender] Chunk batch sent", { transferId, firstChunk: batchStart, nextChunk: batchEnd, totalChunks, bufferedAmount: channel.bufferedAmount });
+        await waitForChunkAck(channel, transferId, batchEnd);
+        if (lastAcknowledgedChunkRef.current < batchEnd) throw new Error("The receiver acknowledged an incomplete chunk batch.");
       }
+      if (lastAcknowledgedChunkRef.current !== totalChunks) throw new Error("The receiver did not acknowledge every chunk.");
       if (transferCancelledRef.current) throw new Error("Transfer cancelled.");
       if (dataChannelRef.current !== channel || channel.readyState !== "open") throw new Error("The direct connection closed before the file could be completed.");
       channel.send(JSON.stringify({ type: "file-end", transferId, totalChunks, size: file.size }));
       fileEndSentRef.current = true;
-      console.info("[DropHut sender] Sent all chunks and file-end", { transferId, totalChunks, size: file.size, firstChunkDelayMs: Math.round(firstChunkDelayMs), maxBufferedAmount: maxBufferedAmountRef.current, backpressureWaits: backpressureWaitsRef.current });
+      console.info("[DropHut sender] All chunks acknowledged; file-end sent", { transferId, totalChunks, size: file.size, firstChunkDelayMs: Math.round(firstChunkDelayMs), maxBufferedAmount: maxBufferedAmountRef.current, backpressureWaits: backpressureWaitsRef.current });
       await waitForTransferControl("file-received", transferId);
       if (transferCancelledRef.current || transferIdRef.current !== transferId) throw new Error("Transfer cancelled.");
       const durationMs = getTransferClock() - transferStartedAtRef.current;
       const mibPerSecond = durationMs > 0 ? file.size / (1024 * 1024) / (durationMs / 1000) : 0;
       console.info("[DropHut sender] Transfer completed and acknowledged", { transferId, fileSize: file.size, totalChunks, durationMs: Math.round(durationMs), mibPerSecond: Number(mibPerSecond.toFixed(2)), maxBufferedAmount: maxBufferedAmountRef.current, backpressureWaits: backpressureWaitsRef.current });
       if (transferTimeoutRef.current !== null) { window.clearTimeout(transferTimeoutRef.current); transferTimeoutRef.current = null; }
-      pendingControlRef.current = null; transferIdRef.current = null; transferFileSizeRef.current = null; fileEndSentRef.current = false; transferCancelledRef.current = false;
+      pendingControlRef.current = null; transferIdRef.current = null; transferFileSizeRef.current = null; fileEndSentRef.current = false; transferCancelledRef.current = false; highestSentChunkRef.current = 0;
       transferStatusRef.current = "sent"; setTransferStatus("sent");
     } catch (reason) {
       if (transferTimeoutRef.current !== null) { window.clearTimeout(transferTimeoutRef.current); transferTimeoutRef.current = null; }
@@ -809,7 +879,7 @@ function CreatePipe({ onHome }: CreatePipeProps) {
         try { channel.send(JSON.stringify({ type: "file-cancel", transferId: activeTransferId })); } catch { /* Receiver cleanup is best effort after a local failure. */ }
       }
       pendingControlRef.current?.reject(reason instanceof Error ? reason : new Error("Transfer failed."));
-      pendingControlRef.current = null; transferIdRef.current = null; transferFileSizeRef.current = null; transferTotalChunksRef.current = 0; fileEndSentRef.current = false;
+      pendingControlRef.current = null; transferIdRef.current = null; transferFileSizeRef.current = null; transferTotalChunksRef.current = 0; highestSentChunkRef.current = 0; fileEndSentRef.current = false;
       const failure = peerTransferErrorRef.current; peerTransferErrorRef.current = null;
       throw failure ? new Error(failure) : reason;
     }
