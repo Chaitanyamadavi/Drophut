@@ -23,12 +23,14 @@ type PipeMessage = {
 };
 
 type JoinStatus = "idle" | "joining" | "connecting" | "connected";
-type IncomingTransfer = { transferId: string; name: string; mimeType: string; size: number; totalChunks: number; chunkSize: number; chunks: ArrayBuffer[]; receivedBytes: number; startedAt: number };
+type IncomingTransfer = { transferId: string; name: string; mimeType: string; size: number; totalChunks: number; chunkSize: number; chunks: ArrayBuffer[]; receivedBytes: number; nextChunk: number; completionState: "receiving" | "completing" | "completed"; startedAt: number };
 type ReceivedFile = { name: string; mimeType: string; size: number; url: string };
 type ReceivedTextMessage = { id: string; text: string };
 type DownloadNotice = { name: string; url: string; openBlocked: boolean };
 const CHUNK_SIZE = 16 * 1024;
 const ACK_BATCH_SIZE = 32;
+// Must match the sender frame: uint16 ID length, uint32 chunk index, UTF-8 transfer ID, then payload.
+const CHUNK_FRAME_HEADER_BYTES = 6;
 
 const ICE_CONFIGURATION: RTCConfiguration = {
   iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
@@ -348,41 +350,63 @@ function JoinPipe({ onHome }: JoinPipeProps) {
         if (typeof message.transferId !== "string" || !message.transferId || typeof message.name !== "string" || !message.name || typeof message.mimeType !== "string" || !validSize || !validChunks || message.chunkSize !== CHUNK_SIZE || message.totalChunks !== Math.ceil((message.size as number) / CHUNK_SIZE)) {
           rejectTransfer("The offered file metadata is invalid.", message.transferId); return;
         }
+        const activeTransfer: IncomingTransfer = {
+          transferId: message.transferId,
+          name: message.name,
+          mimeType: message.mimeType,
+          size: message.size as number,
+          totalChunks: message.totalChunks as number,
+          chunkSize: CHUNK_SIZE,
+          chunks: [],
+          receivedBytes: 0,
+          nextChunk: 0,
+          completionState: "receiving",
+          startedAt: performance.now(),
+        };
+        // Assign the mutable transfer state before scheduling any React UI updates.
+        incomingFileRef.current = activeTransfer;
         setReceivedFile(null);
-        console.info("[DropHut receiver] Transfer started", { transferId: message.transferId, name: message.name, mimeType: message.mimeType, expectedSize: message.size, totalChunks: message.totalChunks, chunkSize: message.chunkSize });
-        setIncomingOffer({ name: message.name, mimeType: message.mimeType, size: message.size as number });
-        incomingFileRef.current = { transferId: message.transferId, name: message.name, mimeType: message.mimeType, size: message.size as number, totalChunks: message.totalChunks as number, chunkSize: CHUNK_SIZE, chunks: [], receivedBytes: 0, startedAt: performance.now() };
+        console.info("[DropHut receiver] Transfer started", { transferId: activeTransfer.transferId, name: activeTransfer.name, mimeType: activeTransfer.mimeType, expectedSize: activeTransfer.size, totalChunks: activeTransfer.totalChunks, chunkSize: activeTransfer.chunkSize });
+        setIncomingOffer({ name: activeTransfer.name, mimeType: activeTransfer.mimeType, size: activeTransfer.size });
         setReceivedBytes(0);
         lastProgressUpdateRef.current = 0;
         setReceiveWarning("The completed file is assembled in browser memory before download. Very large files may exceed available memory.");
         setError("");
         setReceiveStatus("receiving");
-        armIncomingTimeout(channel, message.transferId as string);
-        console.info("[DropHut receiver] Receiver ready for browser download", { transferId: message.transferId });
-        sendTransferControl("receiver-ready", message.transferId);
+        armIncomingTimeout(channel, activeTransfer.transferId);
+        console.info("[DropHut receiver] Receiver state ready synchronously", { transferId: activeTransfer.transferId });
+        sendTransferControl("receiver-ready", activeTransfer.transferId);
         return;
       }
       if (message.type === "file-end") {
         const transfer = incomingFileRef.current;
         if (!transfer || message.transferId !== transfer.transferId) {
-          console.debug("[DropHut receiver] Ignored stale file-end", { transferId: message.transferId, activeTransferId: transfer?.transferId });
+          if (typeof message.transferId === "string") {
+            const errorMessage = retiredTransferIdsRef.current.has(message.transferId) ? "Transfer ended before the complete file was received." : "Received data for an unknown transfer.";
+            console.warn("[DropHut receiver] File end for inactive transfer", { transferId: message.transferId, activeTransferId: transfer?.transferId, message: errorMessage });
+            try { channel.send(JSON.stringify({ type: "file-error", transferId: message.transferId, message: errorMessage })); } catch { /* Connection may already be closed. */ }
+          } else if (transfer) {
+            rejectTransfer("Received file data does not match the transfer metadata.", transfer.transferId);
+          }
           return;
         }
-        if (message.totalChunks !== transfer.totalChunks || message.size !== transfer.size || transfer.chunks.length !== transfer.totalChunks || transfer.receivedBytes !== transfer.size) {
-          rejectTransfer("The received file was incomplete or did not match its metadata.", message.transferId); return;
+        if (transfer.completionState !== "receiving") return;
+        transfer.completionState = "completing";
+        if (message.totalChunks !== transfer.totalChunks || message.size !== transfer.size) {
+          rejectTransfer("Received file data does not match the transfer metadata.", transfer.transferId); return;
+        }
+        if (transfer.nextChunk !== transfer.totalChunks || transfer.chunks.length !== transfer.totalChunks || transfer.receivedBytes !== transfer.size) {
+          rejectTransfer("Transfer ended before the complete file was received.", transfer.transferId); return;
         }
         try {
           const blob = new Blob(transfer.chunks, { type: transfer.mimeType });
-          const { name, mimeType, size, transferId } = transfer;
-          if (blob.size !== size) throw new Error(`Reconstructed file size ${blob.size} did not match expected size ${size}.`);
+          if (blob.size !== transfer.size) throw new Error("Received file data does not match the transfer metadata.");
           const url = URL.createObjectURL(blob);
+          const { name, mimeType, size, transferId } = transfer;
           const durationMs = performance.now() - transfer.startedAt;
           const mibPerSecond = durationMs > 0 ? size / (1024 * 1024) / (durationMs / 1000) : 0;
-          transfer.chunks.length = 0;
           if (incomingTimeoutRef.current !== null) { window.clearTimeout(incomingTimeoutRef.current); incomingTimeoutRef.current = null; }
-          incomingFileRef.current = null;
           retainDownloadedUrl(url);
-          retireTransferId(transferId);
           const downloadLink = document.createElement("a");
           downloadLink.href = url;
           downloadLink.download = name;
@@ -396,6 +420,10 @@ function JoinPipe({ onHome }: JoinPipeProps) {
           setReceiveStatus("received");
           setError("");
           sendTransferControl("file-received", transferId, { size });
+          transfer.chunks.length = 0;
+          transfer.completionState = "completed";
+          if (incomingFileRef.current === transfer) incomingFileRef.current = null;
+          retireTransferId(transferId);
           console.info("[DropHut receiver] File transfer complete and browser download triggered", { transferId, name, mimeType: blob.type, expectedSize: size, reconstructedSize: blob.size, totalChunks: transfer.totalChunks, durationMs: Math.round(durationMs), mibPerSecond: Number(mibPerSecond.toFixed(2)), channelBufferedAmount: dataChannelRef.current?.bufferedAmount ?? 0 });
         } catch (reason) {
           rejectTransfer(reason instanceof Error ? reason.message : "Could not prepare the completed file for download.", transfer.transferId);
@@ -406,29 +434,75 @@ function JoinPipe({ onHome }: JoinPipeProps) {
       return;
     }
 
-    if (!(data instanceof ArrayBuffer)) { rejectTransfer("Received an unsupported file chunk."); return; }
-    const transfer = incomingFileRef.current;
-    if (!transfer) { rejectTransfer("Received file data before the receiver was ready."); return; }
-    if (transfer.chunks.length >= transfer.totalChunks) { rejectTransfer("Received more chunks than expected.", transfer.transferId); return; }
-    const chunkIndex = transfer.chunks.length;
-    const expectedBytes = chunkIndex === transfer.totalChunks - 1 ? transfer.size - chunkIndex * transfer.chunkSize : transfer.chunkSize;
-    if (!Number.isInteger(chunkIndex) || data.byteLength !== expectedBytes) { rejectTransfer("A received file chunk had an invalid size or order.", transfer.transferId); return; }
+    const reportUnknownTransfer = (transferId?: string) => {
+      const message = "Received data for an unknown transfer.";
+      console.error("[DropHut receiver] Binary data belongs to an unknown transfer", { transferId, activeTransferId: incomingFileRef.current?.transferId });
+      if (transferId) {
+        try { channel.send(JSON.stringify({ type: "file-error", transferId, message })); } catch { /* Connection may already be closed. */ }
+      }
+      setError(message);
+      if (!incomingFileRef.current) setReceiveStatus("error");
+    };
+    if (!(data instanceof ArrayBuffer) || data.byteLength < CHUNK_FRAME_HEADER_BYTES) {
+      const active = incomingFileRef.current;
+      if (active) rejectTransfer("Received file data does not match the transfer metadata.", active.transferId);
+      else reportUnknownTransfer();
+      return;
+    }
+    const frameView = new DataView(data);
+    const idLength = frameView.getUint16(0);
+    const payloadOffset = CHUNK_FRAME_HEADER_BYTES + idLength;
+    const activeTransfer = incomingFileRef.current;
+    if (idLength === 0 || payloadOffset > data.byteLength) {
+      if (activeTransfer) rejectTransfer("Received file data does not match the transfer metadata.", activeTransfer.transferId);
+      else reportUnknownTransfer();
+      return;
+    }
+    let chunkTransferId: string;
     try {
-      transfer.chunks.push(data);
-      if (incomingFileRef.current !== transfer) return;
-      transfer.receivedBytes += data.byteLength;
-      armIncomingTimeout(channel, transfer.transferId);
-      const nextChunk = chunkIndex + 1;
+      chunkTransferId = new TextDecoder("utf-8", { fatal: true }).decode(new Uint8Array(data, CHUNK_FRAME_HEADER_BYTES, idLength));
+    } catch {
+      if (activeTransfer) rejectTransfer("Received file data does not match the transfer metadata.", activeTransfer.transferId);
+      else reportUnknownTransfer();
+      return;
+    }
+    if (!activeTransfer || activeTransfer.transferId !== chunkTransferId) {
+      if (retiredTransferIdsRef.current.has(chunkTransferId)) {
+        console.debug("[DropHut receiver] Ignored stale file chunk", { transferId: chunkTransferId });
+        return;
+      }
+      reportUnknownTransfer(chunkTransferId);
+      return;
+    }
+    if (activeTransfer.completionState !== "receiving") {
+      rejectTransfer("Received file data does not match the transfer metadata.", activeTransfer.transferId);
+      return;
+    }
+    const chunkIndex = frameView.getUint32(2);
+    if (chunkIndex !== activeTransfer.nextChunk || chunkIndex >= activeTransfer.totalChunks || activeTransfer.chunks.length !== activeTransfer.nextChunk) {
+      rejectTransfer("Received file data does not match the transfer metadata.", activeTransfer.transferId);
+      return;
+    }
+    const expectedBytes = Math.min(activeTransfer.chunkSize, activeTransfer.size - chunkIndex * activeTransfer.chunkSize);
+    if (data.byteLength - payloadOffset !== expectedBytes) {
+      rejectTransfer("Received file data does not match the transfer metadata.", activeTransfer.transferId);
+      return;
+    }
+    try {
+      activeTransfer.chunks.push(data.slice(payloadOffset));
+      activeTransfer.nextChunk += 1;
+      activeTransfer.receivedBytes += expectedBytes;
+      armIncomingTimeout(channel, activeTransfer.transferId);
       const now = performance.now();
-      if (nextChunk === transfer.totalChunks || now - lastProgressUpdateRef.current >= 100) {
-        setReceivedBytes(transfer.receivedBytes);
+      if (activeTransfer.nextChunk === activeTransfer.totalChunks || now - lastProgressUpdateRef.current >= 100) {
+        setReceivedBytes(activeTransfer.receivedBytes);
         lastProgressUpdateRef.current = now;
       }
-      if (nextChunk % ACK_BATCH_SIZE === 0 || nextChunk === transfer.totalChunks) {
-        sendTransferControl("chunk-ack", transfer.transferId, { nextChunk });
+      if (activeTransfer.nextChunk % ACK_BATCH_SIZE === 0 || activeTransfer.nextChunk === activeTransfer.totalChunks) {
+        sendTransferControl("chunk-ack", activeTransfer.transferId, { nextChunk: activeTransfer.nextChunk });
       }
     } catch (reason) {
-      rejectTransfer(reason instanceof Error ? reason.message : "Could not write a received file chunk.", transfer.transferId);
+      rejectTransfer(reason instanceof Error ? reason.message : "Could not process a received file chunk.", activeTransfer.transferId);
     }
   }
 

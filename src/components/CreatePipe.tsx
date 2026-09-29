@@ -19,6 +19,8 @@ type QueueItem = { id: string; file: File; status: "waiting" | "sending" | "comp
 const CHUNK_SIZE = 16 * 1024;
 const BUFFER_LOW_WATER = 256 * 1024;
 const BUFFER_HIGH_WATER = 512 * 1024;
+// Binary chunk frame: uint16 ID length, uint32 chunk index, UTF-8 transfer ID, then raw file bytes.
+const CHUNK_FRAME_HEADER_BYTES = 6;
 
 const ICE_CONFIGURATION: RTCConfiguration = {
   iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
@@ -307,7 +309,14 @@ function CreatePipe({ onHome }: CreatePipeProps) {
           return;
         }
         if (message.type === "file-received") {
-          if (!fileEndSentRef.current || transferFileSizeRef.current === null || message.size !== transferFileSizeRef.current) return;
+          if (!fileEndSentRef.current || transferFileSizeRef.current === null) return;
+          if (message.size !== transferFileSizeRef.current) {
+            peerTransferErrorRef.current = "The receiver completion acknowledgment did not match the expected file size.";
+            transferCancelledRef.current = true;
+            pendingControlRef.current?.reject(new Error(peerTransferErrorRef.current));
+            pendingControlRef.current = null;
+            return;
+          }
           if (pendingControlRef.current?.type === "file-received") {
             const pending = pendingControlRef.current;
             pendingControlRef.current = null;
@@ -734,9 +743,13 @@ function CreatePipe({ onHome }: CreatePipeProps) {
   async function sendFile(file: File, queueId: string) {
     const channel = dataChannelRef.current;
     if (!channel || channel.readyState !== "open") throw new Error("The direct connection is not open.");
-    const peerLimit = peerConnectionRef.current?.sctp?.maxMessageSize;
-    if (peerLimit && peerLimit > 0 && CHUNK_SIZE > peerLimit) throw new Error("The connection cannot carry the selected chunk size.");
     const transferId = `${sessionCodeRef.current ?? "pipe"}-${++transferSequenceRef.current}-${createLocalId()}`;
+    const transferIdBytes = new TextEncoder().encode(transferId);
+    const chunkHeaderLength = CHUNK_FRAME_HEADER_BYTES + transferIdBytes.byteLength;
+    const peerLimit = peerConnectionRef.current?.sctp?.maxMessageSize;
+    if (transferIdBytes.byteLength > 0xffff || (peerLimit && peerLimit > 0 && CHUNK_SIZE + chunkHeaderLength > peerLimit)) {
+      throw new Error("The connection cannot carry the selected chunk size and transfer header.");
+    }
     transferIdRef.current = transferId; transferFileSizeRef.current = file.size; fileEndSentRef.current = false; transferCancelledRef.current = false;
     transferStartedAtRef.current = getTransferClock(); maxBufferedAmountRef.current = channel.bufferedAmount; backpressureWaitsRef.current = 0; lastProgressUpdateRef.current = 0;
     transferStatusRef.current = "preparing"; setTransferStatus("preparing"); setTransferredBytes(0); setError("");
@@ -758,7 +771,13 @@ function CreatePipe({ onHome }: CreatePipeProps) {
         }
         if (transferCancelledRef.current) throw new Error("Transfer cancelled.");
         const offset = index * CHUNK_SIZE;
-        channel.send(file.slice(offset, Math.min(offset + CHUNK_SIZE, file.size)));
+        const chunkHeader = new Uint8Array(chunkHeaderLength);
+        const headerView = new DataView(chunkHeader.buffer);
+        headerView.setUint16(0, transferIdBytes.byteLength);
+        headerView.setUint32(2, index);
+        chunkHeader.set(transferIdBytes, CHUNK_FRAME_HEADER_BYTES);
+        const chunkPayload = file.slice(offset, Math.min(offset + CHUNK_SIZE, file.size));
+        channel.send(new Blob([chunkHeader, chunkPayload], { type: "application/octet-stream" }));
         sentChunks = index + 1;
         if (index === 0) firstChunkDelayMs = getTransferClock() - transferStartedAtRef.current;
         maxBufferedAmountRef.current = Math.max(maxBufferedAmountRef.current, channel.bufferedAmount);
