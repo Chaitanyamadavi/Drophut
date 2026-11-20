@@ -3,6 +3,7 @@ import CreatePipe from "./components/CreatePipe";
 import JoinPipe from "./components/JoinPipe";
 import Home from "./components/Home";
 import TermsModal from "./components/TermsModal";
+import Footer from "./components/Footer";
 
 type Page = "home" | "send" | "join";
 const CONSENT_KEY = "drophut-terms-accepted";
@@ -51,10 +52,11 @@ function App() {
   }
 
   return (
-    <>
+    <div className="site-shell">
       {content}
+      <Footer />
       {termsOpen && <TermsModal onAccept={acceptTerms} onClose={cancelTerms} />}
-    </>
+    </div>
   );
 }
 
