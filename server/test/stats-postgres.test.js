@@ -61,12 +61,18 @@ test("an unavailable Postgres connection returns 503 without falling back to SQL
   const registered = once(socket, "message");
   socket.send(JSON.stringify({ type: "create-pipe", code: "123456", token: "a".repeat(64) }));
   assert.equal(JSON.parse((await registered)[0]).type, "pipe-created");
-  assert.equal((await stats).status, 503);
-  assert.equal((await server.post("visitors", "b".repeat(32))).status, 503);
-  assert.equal(server.logs().includes(secret), false);
+  const response = await stats;
+  assert.equal(response.status, 503);
+  assert.equal(await response.text(), "");
+  const visitorId = "b".repeat(32);
+  assert.equal((await server.post("visitors", visitorId)).status, 503);
   const closed = once(socket, "close");
   socket.close();
   await closed;
+  await server.stop();
+  assert.match(server.logs(), /\[stats\] Postgres: ECONNREFUSED/);
+  assert.equal(server.logs().includes(secret), false);
+  assert.equal(server.logs().includes(visitorId), false);
 });
 
 const databaseUrl = process.env.TEST_POSTGRES_URL;
