@@ -3,6 +3,7 @@ import { registerVisitor, requestStats, type Stats } from "./statsClient";
 
 export function useHomepageStats() {
   const [stats, setStats] = useState<Stats | null>(null);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     let active = true;
@@ -14,10 +15,12 @@ export function useHomepageStats() {
         uniqueVisitors: Math.max(current?.uniqueVisitors ?? 0, next.uniqueVisitors),
       }));
     }
-    void requestStats().then(display).catch(() => {});
-    void registerVisitor().then(display);
+    void Promise.allSettled([
+      requestStats().then(display),
+      registerVisitor().then(display),
+    ]).then(() => { if (active) setLoading(false); });
     return () => { active = false; };
   }, []);
 
-  return stats;
+  return { stats, loading };
 }

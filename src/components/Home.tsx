@@ -3,13 +3,11 @@ import { useHomepageStats } from "./useHomepageStats";
 type HomeProps = {
   onSend: () => void;
   onJoin: () => void;
+  onStats: () => void;
 };
 
-function Home({ onSend, onJoin }: HomeProps) {
-  const stats = useHomepageStats();
-  const date = stats && new Intl.DateTimeFormat("en-GB", {
-    day: "numeric", month: "short", year: "numeric", timeZone: "UTC",
-  }).format(new Date(stats.visitorsSince));
+function Home({ onSend, onJoin, onStats }: HomeProps) {
+  const { stats } = useHomepageStats();
   return (
     <main className="app-shell home-shell">
       <section className="home-content" aria-labelledby="home-title">
@@ -20,17 +18,11 @@ function Home({ onSend, onJoin }: HomeProps) {
           <button className="button button-primary button-large" onClick={onSend}>Send Files</button>
           <button className="button button-secondary button-large" onClick={onJoin}>Join a Pipe</button>
         </div>
-        <div className="home-stats">
-          {stats && (
-            <>
-              <p className="home-stats-line">
-                <span>{stats.filesTransferred.toLocaleString("en-GB")} files transferred</span>
-                <span>{stats.uniqueVisitors.toLocaleString("en-GB")} {stats.uniqueVisitors === 1 ? "unique visitor" : "unique visitors"} since {date}</span>
-              </p>
-              <p className="home-stats-note">Includes an estimated 1,000 earlier transfers.</p>
-            </>
-          )}
-        </div>
+        <button className="home-stats-link" type="button" onClick={onStats}>
+          <span className="home-stats-link-icon" aria-hidden="true">↗</span>
+          <span>{stats ? `${stats.filesTransferred.toLocaleString("en-GB")}+ files shared` : "See Drophut stats"}</span>
+          <span className="home-stats-link-arrow" aria-hidden="true">→</span>
+        </button>
       </section>
       <p className="home-footnote">Peer-to-peer transfers, connected through signaling.</p>
     </main>
