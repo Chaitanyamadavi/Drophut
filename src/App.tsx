@@ -3,13 +3,14 @@ import CreatePipe from "./components/CreatePipe";
 import JoinPipe from "./components/JoinPipe";
 import Home from "./components/Home";
 import TermsModal from "./components/TermsModal";
+import { readSession } from "./components/pipeSignaling";
 import Footer from "./components/Footer";
 
 type Page = "home" | "send" | "join";
 const CONSENT_KEY = "drophut-terms-accepted";
 
 function App() {
-  const [page, setPage] = useState<Page>("home");
+  const [page, setPage] = useState<Page>(() => readSession("sender") ? "send" : readSession("receiver") ? "join" : "home");
   const [pendingPage, setPendingPage] = useState<Page | null>(null);
   const [termsOpen, setTermsOpen] = useState(false);
 

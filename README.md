@@ -73,3 +73,13 @@ export default defineConfig([
 ])
 
 ```
+
+### Pipe recovery
+
+Deploy the frontend and signaling server together. Both use private per-participant tokens for registration and resume. The DataChannel protocol adds a `file-checkpoint` response to `file-start`. Chunk and completion acknowledgments still travel over the DataChannel. The signaling server handles session membership and WebRTC setup, and file bytes travel directly between devices.
+
+The signaling server keeps each disconnected participant’s place for 90 seconds by default. Set `PIPE_RECONNECT_MS` on the server to change this window. A signaling process restart clears the in-memory pipes. The receiver saves acknowledged batches in IndexedDB. After a reload, the sender can verify and reselect the interrupted file. Other queued file selections live in the sender tab.
+
+Opening Send Files starts the WebSocket handshake while the user picks files, overlapping file selection with a Render Free cold start. An always-on signaling instance removes the idle cold start. Mobile browsers may suspend tabs. Recovery runs when the tab can execute again.
+
+Run `npm test` for signaling regression tests. With desktop Chrome installed, run `node tests/browser-recovery.mjs` for local WebRTC disconnect, reload, and byte comparison tests. Set `CHROME_BIN` if Chrome is installed under a different executable name.
