@@ -101,11 +101,11 @@ The frontend uses the HTTP equivalent of `VITE_SIGNALING_URL` for stats by defau
 2. In the Supabase project dashboard, open **Connect → Session pooler** and copy the URI on port **5432**. Use the host and username shown for your project. Replace the password placeholder with your database password, percent-encoding any characters that have special meaning in a URI. Use TLS with certificate verification. For example:
 
    ```text
-   postgresql://postgres.<PROJECT_REF>:<URL_ENCODED_DATABASE_PASSWORD>@<SESSION_POOLER_HOST>:5432/postgres?sslmode=verify-full
+   postgresql://postgres.<PROJECT_REF>:<URL_ENCODED_DATABASE_PASSWORD>@<SESSION_POOLER_HOST>:5432/postgres
    ```
 
    The Node backend connects over the Postgres protocol through the Session pooler. The Data API can stay disabled. [Supabase connection guide](https://supabase.com/docs/guides/database/connecting-to-postgres)
-3. In Render, open the **Drophut signaling web service → Environment**. Set `DATABASE_URL` to that URI, optionally set `STATS_VISITORS_SINCE`, and deploy the backend build containing the Postgres driver. Keep the URI in the backend environment. [Render environment variable guide](https://render.com/docs/configure-environment-variables)
+3. In Render, open the **Drophut signaling web service → Environment**. Set `DATABASE_URL` to that URI without an `sslmode` parameter. Set `SUPABASE_DB_CA` to the full PEM certificate from Supabase, including the BEGIN and END lines and real line breaks. The backend uses this CA and verifies the server certificate. Optionally set `STATS_VISITORS_SINCE`, and deploy the backend build containing the Postgres driver. Keep the URI in the backend environment. [Render environment variable guide](https://render.com/docs/configure-environment-variables)
 
 With `DATABASE_URL` set, the backend uses a lazy Postgres pool of up to three connections. A connection or query failure returns HTTP 503 for stats and leaves WebSocket signaling available. SQLite is available when `STATS_DB_PATH` is set and `DATABASE_URL` is absent.
 
@@ -115,4 +115,4 @@ After deployment, run this read-only check. Expect HTTP 200 and JSON containing 
 curl --fail-with-body --show-error --include https://drophut.onrender.com/api/stats
 ```
 
-Run `npm test` for the SQLite and Postgres-outage checks. To also exercise live Postgres, set `TEST_POSTGRES_URL` to a fresh, disposable database named `drophut_test` or `drophut_test_<suffix>`. The test writes sample IDs and leaves them in that disposable database. Append `?sslmode=disable` only for a disposable local server running without TLS.
+Run `npm test` for the SQLite and Postgres-outage checks. To also exercise live Postgres, set `TEST_POSTGRES_URL` to a fresh, disposable database named `drophut_test` or `drophut_test_<suffix>`. The test writes sample IDs and leaves them in that disposable database. Enable TLS on the disposable server and set `SUPABASE_DB_CA` to its CA certificate in PEM format if it uses a private CA.

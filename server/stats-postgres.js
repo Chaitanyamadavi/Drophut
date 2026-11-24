@@ -39,10 +39,15 @@ export function createPostgresStats(connectionString) {
     let failed = false;
     try {
       if (!pool) {
+        const url = new URL(connectionString);
+        // node-postgres gives URL TLS options precedence over the supplied CA.
+        for (const key of ["ssl", "sslmode", "sslcert", "sslkey", "sslrootcert", "sslnegotiation"]) {
+          url.searchParams.delete(key);
+        }
         pool = new pg.Pool({
-          connectionString,
+          connectionString: url.href,
           max: 3,
-          ssl: true,
+          ssl: { ca: process.env.SUPABASE_DB_CA, rejectUnauthorized: true },
           connectionTimeoutMillis: 1800,
           idleTimeoutMillis: 10_000,
           query_timeout: 2400,

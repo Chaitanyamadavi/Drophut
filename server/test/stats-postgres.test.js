@@ -52,7 +52,7 @@ test("an unavailable Postgres connection returns 503 without falling back to SQL
   const directory = await mkdtemp(join(tmpdir(), "drophut-postgres-outage-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const secret = "disposable-password-for-log-check";
-  const server = await startServer(t, "postgresql://user:" + secret + "@127.0.0.1:1/drophut_test?sslmode=disable",
+  const server = await startServer(t, "postgresql://user:" + secret + "@127.0.0.1:1/drophut_test",
     join(directory, "fallback.sqlite"));
   const stats = server.get();
   const socket = new WebSocket(server.base.replace("http", "ws"));
@@ -82,14 +82,20 @@ test("Postgres migration is idempotent and concurrent reports stay deduplicated 
 }, async (t) => {
   // The integration test inserts rows. Require an explicitly named, empty test database.
   assert.match(new URL(databaseUrl).pathname, /^\/drophut_test(?:_[a-z0-9]+)?$/);
-  const client = new pg.Client({ connectionString: databaseUrl, ssl: true, connectionTimeoutMillis: 2500 });
+  const client = new pg.Client({
+    connectionString: databaseUrl,
+    ssl: { ca: process.env.SUPABASE_DB_CA, rejectUnauthorized: true },
+    connectionTimeoutMillis: 2500,
+  });
   t.after(() => client.end().catch(() => {}));
   await client.connect();
   const { rows: [existing] } = await client.query("SELECT to_regnamespace('drophut_stats') AS schema");
   assert.equal(existing.schema, null, "Use a fresh disposable Postgres database");
   const migration = await readFile(new URL("../migrations/postgres/001-homepage-stats.sql", import.meta.url), "utf8");
   await client.query(migration);
-  const server = await startServer(t, databaseUrl);
+  const overrideUrl = new URL(databaseUrl);
+  overrideUrl.searchParams.set("sslmode", "verify-full");
+  const server = await startServer(t, overrideUrl.href);
   await expectTotals(server, 1000, 0);
 
   const transfer = "12345678-1234-4234-8234-123456789012";
