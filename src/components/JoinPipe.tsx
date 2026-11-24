@@ -1,3 +1,4 @@
+import { reportCompletedFile } from "./statsClient";
 import { useEffect, useRef, useState, type ChangeEvent } from "react";
 import { assembleFile, deleteSessionBatches, loadCheckpoint, saveCheckpoint, type Checkpoint } from "./pipeCheckpoint";
 import { PipeSignaling, readSession, type Signal, type SignalState } from "./pipeSignaling";
@@ -268,7 +269,12 @@ function JoinPipe({ onHome }: JoinPipeProps) {
     setDownloadNotice({ name, url, openBlocked: false });
     setIncomingOffer(null);
     setReceiveStatus("received");
+    acknowledgeCompletedFile(transferId, size);
+  }
+
+  function acknowledgeCompletedFile(transferId: string, size: number) {
     sendTransferControl("file-received", transferId, { size });
+    reportCompletedFile(transferId);
   }
 
   async function handleDataMessage(channel: RTCDataChannel, data: unknown) {
@@ -335,7 +341,7 @@ function JoinPipe({ onHome }: JoinPipeProps) {
           await completeIncomingTransfer(transfer);
         } else {
           const saved = await loadCheckpoint(key);
-          if (saved?.state === "completed") sendTransferControl("file-received", transferId, { size: saved.size });
+          if (saved?.state === "completed") acknowledgeCompletedFile(transferId, saved.size);
         }
       }
       return;

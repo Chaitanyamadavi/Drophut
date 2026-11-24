@@ -1,4 +1,6 @@
+import { createServer } from "node:http";
 import { WebSocket, WebSocketServer } from "ws";
+import { createStatsHandler } from "./stats.js";
 
 const port = Number(process.env.PORT || 8080);
 const grace = Number(process.env.PIPE_RECONNECT_MS ?? 90_000);
@@ -9,7 +11,14 @@ if (!Number.isSafeInteger(grace) || grace < 1 || grace > 2_147_483_647) {
   throw new Error("PIPE_RECONNECT_MS must be a positive timer interval");
 }
 
-const wss = new WebSocketServer({ port, host: "0.0.0.0", maxPayload: 128 * 1024 });
+const handleStats = createStatsHandler({
+  databaseUrl: process.env.DATABASE_URL,
+  path: process.env.STATS_DB_PATH,
+  since: process.env.STATS_VISITORS_SINCE,
+});
+const server = createServer(handleStats);
+const wss = new WebSocketServer({ server, maxPayload: 128 * 1024 });
+server.listen(port, "0.0.0.0");
 const pipes = new Map();
 
 function send(socket, message) {
@@ -155,5 +164,6 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
     clearInterval(heartbeat);
     for (const socket of wss.clients) socket.terminate();
     wss.close();
+    server.close(() => { void handleStats.close()?.catch(() => {}); });
   });
 }

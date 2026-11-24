@@ -27,8 +27,8 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 
 .site-shell { min-height: 100vh; display: flex; flex-direction: column; }
 .app-shell { min-height: 0; flex: 1 0 auto; }
-.home-shell { display: flex; flex-direction: column; align-items: center; justify-content: center; position: relative; padding: 40px 24px 64px; background: var(--page); }
-.home-content { width: min(100%, 360px); display: flex; flex-direction: column; align-items: center; text-align: center; }
+.home-shell { min-height: 500px; display: flex; flex-direction: column; align-items: center; justify-content: center; position: relative; padding: 40px 24px 64px; background: var(--page); }
+.home-content { position: relative; width: min(100%, 360px); display: flex; flex-direction: column; align-items: center; text-align: center; }
 .brand-mark { position: relative; width: 54px; height: 54px; display: grid; place-items: center; border-radius: 15px; background: var(--ink); color: #FFFFFF; font-family: "Space Grotesk", sans-serif; font-size: 29px; font-weight: 700; }
 .brand-mark::after { position: absolute; right: 8px; bottom: 8px; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); content: ""; }
 .brand-mark.small { width: 30px; height: 30px; border-radius: 8px; font-size: 17px; }
@@ -36,6 +36,9 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .home-content h1 { margin: 19px 0 0; font-family: "Space Grotesk", sans-serif; font-size: 40px; letter-spacing: -1.8px; }
 .tagline { margin: 9px 0 0; color: var(--muted); font-size: 16px; }
 .home-actions { width: 100%; display: grid; gap: 12px; margin-top: 39px; }
+.home-stats { position: absolute; inset: calc(100% + 12px) 0 auto; min-height: 54px; color: var(--muted); font-size: 12px; line-height: 1.4; }
+.home-stats-line { display: flex; flex-wrap: wrap; justify-content: center; gap: 2px 14px; margin: 0; }
+.home-stats-note { margin: 4px 0 0; font-size: 11px; }
 .home-footnote, .privacy-note { color: var(--muted); font-size: 12px; }
 .home-footnote { position: absolute; bottom: 25px; margin: 0; }
 

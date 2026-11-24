@@ -1,0 +1,14 @@
+BEGIN IMMEDIATE;
+
+CREATE TABLE IF NOT EXISTS stats_baseline (
+  name TEXT PRIMARY KEY,
+  total INTEGER NOT NULL
+) STRICT;
+
+INSERT INTO stats_baseline (name, total) VALUES ('files', 1000)
+ON CONFLICT (name) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS completed_transfers (id TEXT PRIMARY KEY) STRICT;
+CREATE TABLE IF NOT EXISTS unique_visitors (id TEXT PRIMARY KEY) STRICT;
+
+COMMIT;
