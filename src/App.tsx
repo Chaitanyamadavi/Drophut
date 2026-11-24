@@ -5,9 +5,8 @@ import Home from "./components/Home";
 import TermsModal from "./components/TermsModal";
 import { readSession } from "./components/pipeSignaling";
 import Footer from "./components/Footer";
-import StatsPage from "./components/StatsPage";
 
-type Page = "home" | "send" | "join" | "stats";
+type Page = "home" | "send" | "join";
 const CONSENT_KEY = "drophut-terms-accepted";
 
 function App() {
@@ -49,10 +48,8 @@ function App() {
     content = <CreatePipe onHome={() => setPage("home")} />;
   } else if (page === "join") {
     content = <JoinPipe onHome={() => setPage("home")} />;
-  } else if (page === "stats") {
-    content = <StatsPage onHome={() => setPage("home")} />;
   } else {
-    content = <Home onSend={() => enterFlow("send")} onJoin={() => enterFlow("join")} onStats={() => setPage("stats")} />;
+    content = <Home onSend={() => enterFlow("send")} onJoin={() => enterFlow("join")} />;
   }
 
   return (
